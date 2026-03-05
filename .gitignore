@@ -1,0 +1,12 @@
+*.json
+tmp.*
+Icon*
+__pycache__/
+*.lock
+*.sqlite
+*.whl
+*.gz
+*.json.[0-9]
+airpollutionwatch.sqlite3
+*.log
+*.sqlite3

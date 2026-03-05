@@ -1,0 +1,23 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "airpollutionwatch-api"
+version = "0.1.0"
+description = "HTTP API server for airpollutionwatch (FastAPI)"
+authors = ["vitroid <vitroid@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.115.12"
+uvicorn = "^0.34.2"
+fastapi-mcp = "^0.3.0"
+pandas = "^2.2.3"
+numpy = "^2.2.0"
+airpollutionwatch = {path = "../airpollutionwatch"}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+
