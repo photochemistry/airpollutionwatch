@@ -1,0 +1,488 @@
+"""
+グリッドAPI: 観測局データを空間補間し、地理院タイル座標系のグリッド値を提供する.
+
+エンドポイント:
+  GET /v1/grid/info      — メタ情報・キャッシュ状況
+  GET /v1/grid/snapshot  — 指定タイル群・1時刻の補間値
+  GET /v1/grid/field     — bbox 内全タイルの補間値（地図描画用）
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import sqlite3
+import time
+from typing import Dict, List
+
+logger = logging.getLogger(__name__)
+
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, Query, HTTPException
+from pydantic import BaseModel
+
+from api_v1 import DB_PATH, POLLUTANT_PARAM_TO_COL
+from grid_cache import (
+    GridCacheEntry,
+    evict_old_cache,
+    get_cache,
+    get_latest_info,
+    put_cache,
+    CACHE_TTL_HOURS,
+)
+from grid_interpolators import interpolate_atps, interpolate_linear, interpolate_tps
+from grid_utils import (
+    BoundingBox,
+    _webmercator_lonlat_to_tile_xy,
+    get_tile_bounds,
+    make_lonlat_grid_tiles,
+)
+from stations_loader import get_stations_df
+
+# 日本全体をカバーする bounding box（沖縄〜北海道、対馬〜国後）
+JAPAN_BBOX = BoundingBox(min_lon=122.0, min_lat=24.0, max_lon=146.0, max_lat=46.0)
+
+AVAILABLE_ZOOM_LEVELS = [12, 14]
+AVAILABLE_METHODS = ["atps", "tps", "linear"]
+AVAILABLE_POLLUTANTS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
+DEFAULT_METHOD = "atps"
+
+router = APIRouter(prefix="/v1/grid", tags=["grid"])
+
+
+# ---------------------------------------------------------------------------
+# Pydantic モデル
+# ---------------------------------------------------------------------------
+
+class GridInfo(BaseModel):
+    available_zoom_levels: List[int]
+    default_method: str
+    available_methods: List[str]
+    pollutants: List[str]
+    latest_grid_at: str | None
+    latest_apw_snapshot_at: str | None
+    cached_hours: int
+
+
+class TileValue(BaseModel):
+    x: int
+    y: int
+    values: Dict[str, float | None]
+
+
+class GridSnapshotResponse(BaseModel):
+    grid_generated_at: str | None
+    apw_snapshot_at: str | None
+    apw_oldest_station_at: str | None
+    z: int
+    datetime: str
+    method: str
+    tiles: List[TileValue]
+
+
+class GridFieldResponse(BaseModel):
+    grid_generated_at: str | None
+    apw_snapshot_at: str | None
+    apw_oldest_station_at: str | None
+    z: int
+    datetime: str
+    method: str
+    pollutant: str
+    tile_x_min: int
+    tile_x_max: int
+    tile_y_min: int
+    tile_y_max: int
+    values: List[List[float | None]]
+
+
+# ---------------------------------------------------------------------------
+# 内部ヘルパー
+# ---------------------------------------------------------------------------
+
+def _fetch_station_snapshot(target_dt_iso: str, pollutant_col: str) -> pd.DataFrame:
+    """
+    全国の測定局について、指定時刻以前の最新測定値を取得する.
+
+    Returns
+    -------
+    DataFrame with columns: station_code, target_datetime, observed_datetime, {pollutant_col}
+    """
+    query = f"""
+        SELECT m.station_code, m.target_datetime, m.observed_datetime, m.{pollutant_col}
+        FROM measurements m
+        INNER JOIN (
+            SELECT station_code, MAX(target_datetime) AS max_dt
+            FROM measurements
+            WHERE target_datetime <= ?
+            GROUP BY station_code
+        ) latest
+            ON  m.station_code    = latest.station_code
+            AND m.target_datetime = latest.max_dt
+        WHERE m.{pollutant_col} IS NOT NULL
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query(query, conn, params=(target_dt_iso,))
+    return df
+
+
+def _get_or_compute_grid(
+    datetime_hour: str,
+    z: int,
+    method: str,
+    pollutant: str,
+    smoothing: float = 0.001,
+) -> GridCacheEntry:
+    """
+    キャッシュから取得。なければ補間計算してキャッシュに保存し返す.
+    """
+    cached = get_cache(datetime_hour, z, method, pollutant, smoothing)
+    if cached is not None:
+        return cached
+
+    pollutant_col = POLLUTANT_PARAM_TO_COL.get(pollutant)
+    if pollutant_col is None:
+        raise HTTPException(status_code=400, detail=f"不明な汚染物質: {pollutant}")
+
+    # 全国スナップショットを DB から取得
+    meas_df = _fetch_station_snapshot(datetime_hour, pollutant_col)
+    if meas_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{datetime_hour} 時点の {pollutant} データがありません",
+        )
+
+    # 測定局の lat/lon と結合
+    stations_df = get_stations_df()
+    meas_df["station_id"] = meas_df["station_code"].apply(
+        lambda c: str(int(c)).zfill(8)
+    )
+    merged = meas_df.merge(
+        stations_df[["station_id", "lat", "lon"]],
+        on="station_id",
+        how="inner",
+    )
+    merged = merged.dropna(subset=["lat", "lon", pollutant_col])
+    merged[pollutant_col] = pd.to_numeric(merged[pollutant_col], errors="coerce")
+    merged = merged.dropna(subset=[pollutant_col])
+
+    if merged.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{datetime_hour} 時点の {pollutant} に有効な測定値がありません",
+        )
+
+    lon = merged["lon"].to_numpy(dtype=float)
+    lat = merged["lat"].to_numpy(dtype=float)
+    values = merged[pollutant_col].to_numpy(dtype=float)
+
+    apw_snapshot_at = str(merged["target_datetime"].max())
+    apw_oldest_station_at = (
+        str(merged["observed_datetime"].min())
+        if "observed_datetime" in merged.columns
+        else apw_snapshot_at
+    )
+
+    # タイルグリッドを生成
+    lon2d, lat2d = make_lonlat_grid_tiles(JAPAN_BBOX, z)
+
+    # 補間
+    smoothing_desc = f"smoothing={smoothing}" if method in ("atps", "tps") else ""
+    logger.info(
+        "grid cache miss – computing: %s z=%d %s %s %s stations=%d",
+        datetime_hour, z, method, pollutant, smoothing_desc, len(values),
+    )
+    t0 = time.perf_counter()
+
+    if method == "atps":
+        field = interpolate_atps(lon, lat, values, lon2d, lat2d, smoothing=smoothing)
+    elif method == "tps":
+        field = interpolate_tps(lon, lat, values, lon2d, lat2d, smoothing=smoothing)
+    elif method == "linear":
+        field = interpolate_linear(lon, lat, values, lon2d, lat2d)
+    else:
+        raise HTTPException(status_code=400, detail=f"不明なメソッド: {method}")
+
+    elapsed = time.perf_counter() - t0
+    tile_x_min, tile_x_max, tile_y_min, tile_y_max = get_tile_bounds(JAPAN_BBOX, z)
+    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    logger.info(
+        "grid cache updated: %s z=%d %s %s %s  shape=%s  %.2fs",
+        datetime_hour, z, method, pollutant, smoothing_desc,
+        f"{field.shape[0]}x{field.shape[1]}", elapsed,
+    )
+
+    put_cache(
+        datetime_hour, z, method, pollutant,
+        tile_x_min, tile_x_max, tile_y_min, tile_y_max,
+        field.astype(np.float32),
+        apw_snapshot_at, apw_oldest_station_at, generated_at,
+        smoothing=smoothing,
+    )
+
+    return GridCacheEntry(
+        tile_x_min=tile_x_min,
+        tile_x_max=tile_x_max,
+        tile_y_min=tile_y_min,
+        tile_y_max=tile_y_max,
+        field=field.astype(np.float32),
+        apw_snapshot_at=apw_snapshot_at,
+        apw_oldest_station_at=apw_oldest_station_at,
+        generated_at=generated_at,
+    )
+
+
+def _tile_to_index(
+    tx: int, ty: int, entry: GridCacheEntry
+) -> tuple[int, int] | tuple[None, None]:
+    """
+    タイル座標 (tx, ty) をフィールド配列の (row, col) インデックスに変換する.
+
+    フィールドの行方向: 南→北（row 0 = tile y_max = 最南端）
+    フィールドの列方向: 西→東（col 0 = tile x_min = 最西端）
+    """
+    col = tx - entry["tile_x_min"]
+    row = entry["tile_y_max"] - ty
+    ny, nx = entry["field"].shape
+    if col < 0 or col >= nx or row < 0 or row >= ny:
+        return None, None
+    return row, col
+
+
+# ---------------------------------------------------------------------------
+# エンドポイント
+# ---------------------------------------------------------------------------
+
+@router.get("/info", response_model=GridInfo)
+async def grid_info():
+    """グリッド API のメタ情報・キャッシュ状況を返す。"""
+    evict_old_cache()
+    latest_grid_at, latest_apw_snapshot_at = get_latest_info()
+    return GridInfo(
+        available_zoom_levels=AVAILABLE_ZOOM_LEVELS,
+        default_method=DEFAULT_METHOD,
+        available_methods=AVAILABLE_METHODS,
+        pollutants=AVAILABLE_POLLUTANTS,
+        latest_grid_at=latest_grid_at,
+        latest_apw_snapshot_at=latest_apw_snapshot_at,
+        cached_hours=CACHE_TTL_HOURS,
+    )
+
+
+@router.get("/snapshot", response_model=GridSnapshotResponse)
+async def grid_snapshot(
+    z: int = Query(..., description="ズームレベル（12 または 14）"),
+    tiles: str = Query(
+        ...,
+        description="x,y ペアをセミコロン区切り。例: 3550,1520;3551,1520",
+    ),
+    pollutants: str = Query(
+        "no2,ox,pm25",
+        description="カンマ区切りの汚染物質名（no2, ox, pm25, so2, no, nox, spm, co など）",
+    ),
+    datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
+    method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
+    smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+):
+    """指定タイル群・1 時刻の補間値スナップショットを返す。"""
+    if z not in AVAILABLE_ZOOM_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"z は {AVAILABLE_ZOOM_LEVELS} のいずれかにしてください",
+        )
+    if method not in AVAILABLE_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
+        )
+
+    # tiles パース
+    tile_list: list[tuple[int, int]] = []
+    for token in tiles.split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(",")
+        if len(parts) != 2:
+            raise HTTPException(
+                status_code=400, detail=f"tiles の形式が不正: {token!r}"
+            )
+        try:
+            tile_list.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"tiles の整数変換に失敗: {token!r}"
+            )
+    if not tile_list:
+        raise HTTPException(status_code=400, detail="tiles を 1 つ以上指定してください")
+
+    # datetime パース・正時丸め
+    try:
+        dt = datetime.datetime.fromisoformat(datetime_)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="datetime の形式が不正（ISO 8601 で指定してください）",
+        )
+    dt_hour = dt.replace(minute=0, second=0, microsecond=0)
+    dt_hour_iso = dt_hour.isoformat()
+
+    # 汚染物質リスト
+    pollutant_list = [p.strip().lower() for p in pollutants.split(",") if p.strip()]
+    unknown = [p for p in pollutant_list if p not in POLLUTANT_PARAM_TO_COL]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"不明な汚染物質: {unknown}")
+
+    # 各タイルの値を収集
+    tile_values: dict[tuple[int, int], dict[str, float | None]] = {
+        (tx, ty): {} for tx, ty in tile_list
+    }
+    grid_generated_at = None
+    apw_snapshot_at = None
+    apw_oldest_station_at = None
+
+    for pollutant in pollutant_list:
+        entry = _get_or_compute_grid(dt_hour_iso, z, method, pollutant, smoothing)
+        if grid_generated_at is None:
+            grid_generated_at = entry["generated_at"]
+            apw_snapshot_at = entry["apw_snapshot_at"]
+            apw_oldest_station_at = entry["apw_oldest_station_at"]
+        for tx, ty in tile_list:
+            row, col = _tile_to_index(tx, ty, entry)
+            if row is None:
+                tile_values[(tx, ty)][pollutant] = None
+            else:
+                v = float(entry["field"][row, col])
+                tile_values[(tx, ty)][pollutant] = None if np.isnan(v) else v
+
+    tiles_out = [
+        TileValue(x=tx, y=ty, values=tile_values[(tx, ty)])
+        for tx, ty in tile_list
+    ]
+    return GridSnapshotResponse(
+        grid_generated_at=grid_generated_at,
+        apw_snapshot_at=apw_snapshot_at,
+        apw_oldest_station_at=apw_oldest_station_at,
+        z=z,
+        datetime=dt_hour_iso,
+        method=method,
+        tiles=tiles_out,
+    )
+
+
+@router.get("/field", response_model=GridFieldResponse)
+async def grid_field(
+    z: int = Query(..., description="ズームレベル（12 または 14）"),
+    pollutant: str = Query(..., description="1 種類の汚染物質名"),
+    datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
+    bbox: str | None = Query(
+        None,
+        description="min_lon,min_lat,max_lon,max_lat（省略時は全国）",
+    ),
+    method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
+    smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+):
+    """bbox 内の全タイルの補間値を返す（地図描画用）。bbox 省略時は全国。"""
+    if z not in AVAILABLE_ZOOM_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"z は {AVAILABLE_ZOOM_LEVELS} のいずれかにしてください",
+        )
+    if method not in AVAILABLE_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
+        )
+
+    pollutant = pollutant.strip().lower()
+    if pollutant not in POLLUTANT_PARAM_TO_COL:
+        raise HTTPException(status_code=400, detail=f"不明な汚染物質: {pollutant}")
+
+    try:
+        dt = datetime.datetime.fromisoformat(datetime_)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="datetime の形式が不正（ISO 8601 で指定してください）",
+        )
+    dt_hour = dt.replace(minute=0, second=0, microsecond=0)
+    dt_hour_iso = dt_hour.isoformat()
+
+    entry = _get_or_compute_grid(dt_hour_iso, z, method, pollutant, smoothing)
+    field = entry["field"]
+    tx_min = entry["tile_x_min"]
+    tx_max = entry["tile_x_max"]
+    ty_min = entry["tile_y_min"]
+    ty_max = entry["tile_y_max"]
+
+    # 出力範囲の初期値（全国）
+    out_tx_min, out_tx_max = tx_min, tx_max
+    out_ty_min, out_ty_max = ty_min, ty_max
+
+    # bbox が指定されている場合は範囲を絞り込む
+    if bbox is not None:
+        parts = bbox.split(",")
+        if len(parts) != 4:
+            raise HTTPException(
+                status_code=400,
+                detail="bbox は min_lon,min_lat,max_lon,max_lat の形式で指定してください",
+            )
+        try:
+            bmin_lon, bmin_lat, bmax_lon, bmax_lat = (float(p) for p in parts)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="bbox の数値変換に失敗しました"
+            )
+
+        bx_min_f, by_max_f = _webmercator_lonlat_to_tile_xy(bmin_lon, bmin_lat, z)
+        bx_max_f, by_min_f = _webmercator_lonlat_to_tile_xy(bmax_lon, bmax_lat, z)
+
+        import math
+        bx_min = max(int(math.floor(min(bx_min_f, bx_max_f))), tx_min)
+        bx_max = min(int(math.floor(max(bx_min_f, bx_max_f))), tx_max)
+        by_min = max(int(math.floor(min(by_min_f, by_max_f))), ty_min)
+        by_max = min(int(math.floor(max(by_min_f, by_max_f))), ty_max)
+
+        if bx_min > bx_max or by_min > by_max:
+            return GridFieldResponse(
+                grid_generated_at=entry["generated_at"],
+                apw_snapshot_at=entry["apw_snapshot_at"],
+                apw_oldest_station_at=entry["apw_oldest_station_at"],
+                z=z, datetime=dt_hour_iso, method=method, pollutant=pollutant,
+                tile_x_min=bx_min, tile_x_max=bx_max,
+                tile_y_min=by_min, tile_y_max=by_max,
+                values=[],
+            )
+        out_tx_min, out_tx_max = bx_min, bx_max
+        out_ty_min, out_ty_max = by_min, by_max
+
+    # フィールド配列から部分配列を切り出す
+    # col: tile_x_min=0 ... tile_x_max=nx-1 (west→east)
+    # row: tile_y_max=0 ... tile_y_min=ny-1 (south→north in field, tile y は北が小さい)
+    col_start = out_tx_min - tx_min
+    col_end   = out_tx_max - tx_min + 1
+    row_start = ty_max - out_ty_max   # より南側（tile y 大）が field の小さい row
+    row_end   = ty_max - out_ty_min + 1
+
+    sub_field = field[row_start:row_end, col_start:col_end]
+
+    values_2d: list[list[float | None]] = [
+        [None if np.isnan(v) else float(v) for v in row_arr]
+        for row_arr in sub_field
+    ]
+
+    return GridFieldResponse(
+        grid_generated_at=entry["generated_at"],
+        apw_snapshot_at=entry["apw_snapshot_at"],
+        apw_oldest_station_at=entry["apw_oldest_station_at"],
+        z=z,
+        datetime=dt_hour_iso,
+        method=method,
+        pollutant=pollutant,
+        tile_x_min=out_tx_min,
+        tile_x_max=out_tx_max,
+        tile_y_min=out_ty_min,
+        tile_y_max=out_ty_max,
+        values=values_2d,
+    )

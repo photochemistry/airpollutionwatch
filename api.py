@@ -11,7 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi_mcp import FastApiMCP
 
+import logging
+
 from api_v1 import router as v1_router
+from api_v1_grid import router as v1_grid_router
 
 ROOT = Path(__file__).resolve().parent
 with open(ROOT / "pyproject.toml", "rb") as f:
@@ -24,6 +27,7 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 ## API バージョン
 
 - **v1** (`/v1/...`): 現行のエンドポイント（都道府県・測定局・測定データ・収集ログなど）
+- **v1/grid** (`/v1/grid/...`): グリッドAPI（空間補間による地理院タイル単位の測定値）
 
 ## 主なエンドポイント（v1）
 
@@ -34,6 +38,12 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 - `GET /v1/latest` — 指定局または県内の直近最新値
 - `GET /v1/coverage` — 県別の連続データ期間（HTML）
 - `GET /v1/collect.log` / `GET /v1/log` — 収集ジョブログ（テキスト／HTML）
+
+## グリッドエンドポイント（v1/grid）
+
+- `GET /v1/grid/info` — メタ情報・キャッシュ状況
+- `GET /v1/grid/snapshot` — 指定タイル群・1時刻の補間値（z, tiles, pollutants, datetime）
+- `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, pollutant, datetime, bbox）
 
 ## 利用の流れ
 
@@ -82,11 +92,21 @@ mcp = FastApiMCP(app)
 mcp.mount()
 
 app.include_router(v1_router)
+app.include_router(v1_grid_router)
+
+
+@app.on_event("startup")
+async def _setup_grid_logging() -> None:
+    """uvicorn の logging 設定完了後に api_v1_grid ロガーを接続する."""
+    grid_logger = logging.getLogger("api_v1_grid")
+    grid_logger.setLevel(logging.INFO)
+    if not grid_logger.handlers:
+        for handler in logging.getLogger("uvicorn").handlers:
+            grid_logger.addHandler(handler)
+        grid_logger.propagate = False
 
 
 if __name__ == "__main__":
-    from logging import basicConfig, DEBUG
-    basicConfig(level=DEBUG)
     log_config = uvicorn.config.LOGGING_CONFIG
     log_config["formatters"]["access"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"
     log_config["formatters"]["default"]["fmt"] = "%(asctime)s - %(levelname)s - %(message)s"

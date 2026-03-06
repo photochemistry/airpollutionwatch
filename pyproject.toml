@@ -17,6 +17,7 @@ fastapi-mcp = "^0.3.0"
 pandas = "^2.2.3"
 numpy = "^2.2.0"
 airpollutionwatch = {path = "../airpollutionwatch"}
+scipy = "^1.17.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
