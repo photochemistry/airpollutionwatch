@@ -12,11 +12,14 @@ Web API 経由で参照できるようにするサービスです。
 - **ベース URL**: `https://andersan.net:8089`
 - **API ドキュメント**: `https://andersan.net:8089/docs`  
   FastAPI 標準の Swagger UI が表示されます（説明文は日本語）。
+- **バージョン**: 現行のエンドポイントは **v1** として `/v1/...` にあります（例: `/v1/prefectures`, `/v1/measurements`）。
 
 提供する主な機能:
 
 - 都道府県ごとの大気環境データ（1 時間ごと）の取得
 - 測定項目の単位・意味などの仕様情報の取得
+- 測定局メタデータの取得（一覧・詳細）
+- 局指定・期間指定の測定データ（`/v1/measurements`）と直近の最新値（`/v1/latest`）
 - どこまで過去の時刻まで連続データがあるかの可視化
 - バックグラウンド収集ジョブのログ閲覧
 
@@ -45,91 +48,64 @@ poetry run python api.py
 
 ## エンドポイント一覧
 
-### `GET /prefectures`
+### `GET /v1/prefectures`
 
-- **説明**: 取得可能な都道府県 ID の一覧を返します。
+- **説明**: 都道府県一覧（id・日本語名・データ取得可否・地域ブロック）を返します。
 - **用途**:
-  - `/items/{prefecture}/{datehour}` を叩く前に、有効な `prefecture` 値を確認したいとき。
+  - ドロップダウンや地図で都道府県を表示するときのマスターデータ。
+  - `has_data` が `true` の県のみ、`/v1/measurements?pref=...` でデータ取得が可能です。
 - **レスポンス例**:
 
 ```json
-["hokkaido", "aomori", "iwate", "miyagi", "akita", "..."]
+[
+  { "id": "hokkaido", "name_ja": "北海道", "has_data": true, "region": "北海道" },
+  { "id": "aomori", "name_ja": "青森県", "has_data": true, "region": "東北" },
+  { "id": "tokyo", "name_ja": "東京都", "has_data": true, "region": "関東" }
+]
 ```
 
-ここで返る文字列を、そのまま `{prefecture}` パスパラメータとして使用します。
+- `region` は「北海道」「東北」「関東」「中部」「近畿」「中国」「四国」「九州」「沖縄」のいずれかです。
+- 地域順・日本語名順でソートされています。
 
 ---
 
-### `GET /items/{prefecture}/{datehour}`
+### `GET /v1/measurements`（測定データ）【実装済み】
 
-- **説明**: 指定した都道府県・時刻の大気環境データを返します。
-- **パスパラメータ**:
-  - `prefecture`  
-    都道府県 ID（例: `"tokyo"`, `"kanagawa"`, `"hokkaido"` など）。  
-    値は `/prefectures` のレスポンスに含まれるキーのみ有効です。
-  - `datehour`  
-    ISO 8601 形式の日時（例: `"2024-09-03T06:00+09:00"`）。  
-    分以下は切り捨てられ、内部では正時に丸められます。
+- **説明**: 局（または都道府県）・期間を指定して測定データを取得します。`format` でレスポンスの並び方（時系列／1 時刻スナップショット）を切り替えられます。
+- **クエリパラメータ**:
+  - `station_ids`: 国環研局番のカンマ区切り。**`pref` とどちらか一方を指定。**
+  - `pref`: 都道府県 ID。指定した場合、その県内の全局を対象とする。
+  - `from`: 期間の開始日時（ISO 8601 形式）。
+  - `to`: 期間の終了日時（ISO 8601 形式）。`format=snapshot` のときは `from` と同一時刻を指定すること。
+  - `pollutants`: 測定項目のカンマ区切り（既定: `pm25,ox,no2`）。指定可能: so2, no, no2, nox, ox, spm, pm25, co, nmhc, ch4, thc, wd, ws, temp, hum。
+  - `interval`: 現状は `1h` または `raw`。`24h` は未対応。
+  - `format`: `series`（既定）＝時系列形式。`snapshot`＝1 時刻の局単位配列（1 時間フォールバック付き）。
+- **レスポンス**:
+  - `format=series`: `timeseries` 配列。各要素は `station_id`・`pollutant`・`values`（`{ datetime, value }` の配列）。
+  - `format=snapshot`: `target_datetime`・`actual_datetime`・`data`（局ごとの配列）・`spec`。
 
-- **フォールバック動作**:
-  - 指定した正時 `datehour` に対応する `target_datetime` のデータがなければ、
-    自動的に **1 時間前** の `target_datetime` までフォールバックして検索します。
-  - それでも見つからない場合は `404 Not Found` になります。
+#### レスポンス形式（series と snapshot）— 軸の取り方
 
-- **レスポンスの構造**（概略）:
+どちらも同じ「局×測定項目×時刻」のデータです。**多次元配列の軸の取り方を変えているだけ**です。
 
-```json
-{
-  "data": {
-    "station_code": { "0": 13114010, "1": 13114510 },
-    "observed_datetime": {
-      "0": "2024-09-03T06:00:00+09:00",
-      "1": "2024-09-03T06:00:00+09:00"
-    },
-    "SO2": { "0": 1.2, "1": 0.8 },
-    "NO":  { "0": 5.1, "1": 3.4 },
-    "NO2": { "0": 8.0, "1": 6.5 },
-    "PM25": { "0": 12.0, "1": 15.3 },
-    "...": {}
-  },
-  "spec": {
-    "SO2": {
-      "name": "SO2",
-      "unit": "ppb",
-      "description": "硫黄酸化物",
-      "type": "float",
-      "default": 0.0
-    },
-    "PM25": {
-      "name": "PM25",
-      "unit": "ug/m3",
-      "description": "PM2.5",
-      "type": "float",
-      "default": 0.0
-    }
-  }
-}
-```
+- **format=series**: 外側の軸が **(局, 測定項目)** の組。各要素の `values` が時刻の配列（from=to のときは長さ 1）。
+- **format=snapshot**: 外側の軸が **局**。各要素が、その 1 時刻の全測定項目をキーにしたオブジェクト（`station_id`・`observed_datetime` と PM25, OX など）。
 
-- `data` セクション  
-  - 各キー（`SO2`, `NO2`, `PM25`, `station_code`, `observed_datetime` など）は  
-    「内部行番号 → 値」の辞書になっています。
-  - `station_code` と `observed_datetime` を組み合わせることで、  
-    「どの測定局の・いつの値か」を特定できます。
+時系列グラフには series、地図や表の 1 時刻表示には snapshot が向きます。
 
-- `spec` セクション  
-  - 各測定項目について、単位・意味・型・デフォルト値を含むメタ情報を返します。
-  - グラフ描画や UI ラベル表示などで利用できます。
-
-#### 簡単な利用例（curl）
+#### 利用例（curl）
 
 ```bash
-curl "https://andersan.net:8089/items/tokyo/2024-09-03T06:00:00%2B09:00"
+# 局指定・時系列
+curl "https://andersan.net:8089/v1/measurements?station_ids=13114010,13114510&from=2024-09-03T00:00:00%2B09:00&to=2024-09-03T06:00:00%2B09:00"
+
+# 県指定・1 時刻スナップショット（局単位配列・フォールバック付き）
+curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00:00%2B09:00&to=2024-09-03T06:00:00%2B09:00&format=snapshot&pollutants=pm25,ox,no2"
 ```
 
 ---
 
-### `GET /coverage`
+### `GET /v1/coverage`
 
 - **説明**: 各都道府県ごとに、どこまで過去にさかのぼって連続データがあるかを HTML テーブルで返します。
 - **詳細**:
@@ -140,11 +116,11 @@ curl "https://andersan.net:8089/items/tokyo/2024-09-03T06:00:00%2B09:00"
   - どの県の履歴がどのくらい埋まっているかの可視化。
   - cron やスクレイパの不調により、どこかの県だけ欠けていないかをブラウザでざっと確認したいとき。
 
-ブラウザで `https://andersan.net:8089/coverage` にアクセスしてください。
+ブラウザで `https://andersan.net:8089/v1/coverage` にアクセスしてください。
 
 ---
 
-### `GET /collect.log`
+### `GET /v1/collect.log`
 
 - **説明**: 収集ジョブのログファイル（`collect.log`）の中身をプレーンテキストで返します。
 - **用途**:
@@ -154,26 +130,88 @@ curl "https://andersan.net:8089/items/tokyo/2024-09-03T06:00:00%2B09:00"
 `curl` での例:
 
 ```bash
-curl "https://andersan.net:8089/collect.log"
+curl "https://andersan.net:8089/v1/collect.log"
 ```
 
 ---
 
-### `GET /log`
+### `GET /v1/log`
 
 - **説明**: `collect.log` をブラウザで閲覧するための簡易 HTML ビューを返します。
-  - クライアント側 JavaScript により、5 分ごとに自動で `/collect.log` を再取得します。
+  - クライアント側 JavaScript により、5 分ごとに自動で `/v1/collect.log` を再取得します。
 - **用途**:
   - ターミナルを開かずに、ブラウザから常時ログをモニタしたい場合。
 
-ブラウザで `https://andersan.net:8089/log` にアクセスしてください。
+ブラウザで `https://andersan.net:8089/v1/log` にアクセスしてください。
+
+---
+
+### `GET /v1/stations`（局メタデータ一覧）【実装済み】
+
+- **説明**: 取得可能な測定局（station）の一覧を返します。データソースは国環研の測定局一覧（TM20210000）を SQLite に変換したものです。
+- **クエリパラメータ**:
+  - `pref`: 都道府県 ID（例: `tokyo`）。指定がなければ全国。
+  - `has`: `pm25,ox` のようにカンマ区切りで指定すると、その測定項目を観測している局のみ返します。指定可能: `pm25`, `ox`, `so2`, `no`, `no2`, `nox`, `co`, `spm`, `nmhc`, `ch4`, `thc`, `wd`, `ws`, `temp`, `hum`。
+- **用途**: 地図表示や UI 上で局を選択させるときのマスターデータとして利用。
+- **データ源**: `TM20210000.py` の CSV をそのまま読み込み、メモリ上の pandas DataFrame で保持して検索しています（約 1MB のため SQLite は使っていません）。事前の DB 投入は不要です。
+
+---
+
+### `GET /v1/stations/{station_id}`（局詳細）【実装済み】
+
+- **説明**: 指定した測定局の詳細情報（住所、局種別、測定項目の有無など）を返します。
+- **パスパラメータ**: `station_id` — 国環研局番（8桁、または先頭の 0 を省略した桁数）。
+- **用途**: グラフ横に局のラベルや説明を表示したい場合。
+
+---
+
+### `GET /v1/latest`（最新値）【実装済み】
+
+- **説明**: 指定した局、または都道府県内の全局について、直近の最新値を返します。
+- **クエリパラメータ**:
+  - `station_ids`: 国環研局番のカンマ区切り。**`pref` とどちらか一方のみ指定可。**
+  - `pref`: 都道府県 ID。指定した場合、その都道府県に属する局の最新値を返す。
+  - `pollutants`: 測定項目のカンマ区切り（例: `pm25,ox`）。
+- **レスポンス**: `datetime`（対象とした最新の target_datetime）、`stations`（局ごとの `station_id` と `values` 辞書）。
+- **用途**: ダッシュボードやウィジェットで「いま」の状況を表示する。
+
+---
+
+## 将来追加を検討しているエンドポイント案
+
+※以下は**まだ実装されていない**仕様案です。
+
+### 集約・統計系
+
+#### `GET /summary/daily`
+
+- **説明**: 局番号と期間を指定して、日別の統計量（平均・最大・最小など）を返します。
+- **主なクエリパラメータ案**:
+  - `station_ids`: 対象局番号（複数可）。
+  - `from`: 期間の開始日。
+  - `to`: 期間の終了日。
+  - `pollutants`: 対象測定項目。
+  - `stat`: `avg,max,min,p95` など、計算する統計量。
+- **用途**:
+  - 「1 週間の PM2.5 日平均」のようなグラフや、CSV ダウンロードによるオフライン解析。
+
+#### `GET /summary/exceedances`
+
+- **説明**: しきい値を超えた回数や時間数などを集計して返します。
+- **主なクエリパラメータ案**:
+  - `station_ids`: 対象局番号（複数可）。
+  - `from`, `to`: 集計期間。
+  - `pollutant`: 対象測定項目（例: `pm25`）。
+  - `threshold`: しきい値（例: `35` µg/m³）。
+- **用途**:
+  - 規準値超過日数・時間数を簡単に把握したい研究・行政向けのレポート用途。
 
 ---
 
 ## 注意事項
 
 - 各都道府県のウェブサイト仕様変更により、突然データ取得に失敗することがあります。  
-  `/collect.log` や `/coverage` を併用して状態を確認してください。
+  `/v1/collect.log` や `/v1/coverage` を併用して状態を確認してください。
 - 00 時ちょうどのデータが存在しない県については、前日 24 時の値になる場合があります。
 
 現時点では、次の 3 県については API 対応が完了していません（今後対応予定です）。
