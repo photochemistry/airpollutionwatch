@@ -42,6 +42,7 @@ PREF_ID_TO_REGION: Dict[str, str] = {
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "airpollutionwatch.sqlite3"
 COLLECT_LOG_PATH = ROOT / "collect.log"
+AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
@@ -96,13 +97,13 @@ POLLUTANT_PARAM_TO_COL = {
 class HourlyStationPoint(BaseModel):
     model_config = ConfigDict(extra="allow")
     station_id: str = Field(..., description="国環研局番（8桁）")
+    target_datetime: str = Field(..., description="収集ジョブが対象とした正時 (ISO8601)。局ごとに異なる場合がある")
     observed_datetime: str = Field(..., description="観測時刻 ISO8601")
 
 
 class HourlyResponse(BaseModel):
     target_datetime: str = Field(..., description="リクエストで指定した時刻 (ISO8601)")
-    actual_datetime: str = Field(..., description="実際に採用した target_datetime（フォールバック時は異なる）")
-    data: List[HourlyStationPoint] = Field(..., description="局ごとの測定値")
+    data: List[HourlyStationPoint] = Field(..., description="局ごとの測定値（各局の target_datetime はデータ内を参照）")
     spec: Dict[str, Any] = Field(..., description="測定項目ごとの仕様（返した項目のみ）")
 
 
@@ -270,13 +271,18 @@ async def get_measurements(
         raise HTTPException(status_code=400, detail="station_ids または pref を指定してください")
 
     if pref is not None:
-        if pref not in prefecture_retrievers:
-            raise HTTPException(status_code=404, detail="都道府県が見つかりません")
-        df_st = get_stations_df()
-        if df_st.empty:
-            raise HTTPException(status_code=404, detail="局メタデータを取得できません")
-        pref_stations = df_st[df_st["pref"] == pref]
-        codes = [_station_id_to_code(str(s)) for s in pref_stations["station_id"]] if not pref_stations.empty else []
+        if pref == "japan":
+            # retrieve all prefectures
+            df_st = get_stations_df()
+            codes = [_station_id_to_code(str(s)) for pref in prefecture_retrievers.keys() for s in df_st[df_st["pref"] == pref]["station_id"]]
+        else:
+            if pref not in prefecture_retrievers:
+                raise HTTPException(status_code=404, detail="都道府県が見つかりません")
+            df_st = get_stations_df()
+            if df_st.empty:
+                raise HTTPException(status_code=404, detail="局メタデータを取得できません")
+            pref_stations = df_st[df_st["pref"] == pref]
+            codes = [_station_id_to_code(str(s)) for s in pref_stations["station_id"]] if not pref_stations.empty else []
     else:
         try:
             codes = [_station_id_to_code(s.strip()) for s in station_ids.split(",") if s.strip()]
@@ -302,40 +308,32 @@ async def get_measurements(
     if format == "snapshot":
         if from_rounded != to_rounded:
             raise HTTPException(status_code=400, detail="format=snapshot のときは from と to に同一時刻（同一正時）を指定してください。")
-        candidate_hours = [from_rounded, from_rounded - datetime.timedelta(hours=1)]
-        col_list = ", ".join(["station_code", "observed_datetime"] + cols)
-        df: pd.DataFrame | None = None
-        actual_dt: datetime.datetime | None = None
 
-        if pref is not None:
-            with sqlite3.connect(DB_PATH) as conn:
-                for dt in candidate_hours:
-                    target_iso = dt.isoformat()
-                    query = f"SELECT {col_list} FROM measurements WHERE prefecture = ? AND target_datetime = ?"
-                    tmp = pd.read_sql_query(query, conn, params=(pref, target_iso))
-                    if not tmp.empty:
-                        df = tmp
-                        actual_dt = dt
-                        break
-        else:
-            placeholders = ",".join("?" * len(codes))
-            with sqlite3.connect(DB_PATH) as conn:
-                for dt in candidate_hours:
-                    target_iso = dt.isoformat()
-                    query = f"SELECT {col_list} FROM measurements WHERE station_code IN ({placeholders}) AND target_datetime = ?"
-                    tmp = pd.read_sql_query(query, conn, params=(*codes, target_iso))
-                    if not tmp.empty:
-                        df = tmp
-                        actual_dt = dt
-                        break
+        # 局ごとに from_rounded 以前の最新 target_datetime を取得し、そのデータを返す
+        placeholders = ",".join("?" * len(codes))
+        m_cols = ", ".join(["m.station_code", "m.target_datetime", "m.observed_datetime"] + [f"m.{c}" for c in cols])
+        query = f"""
+            SELECT {m_cols}
+            FROM measurements m
+            INNER JOIN (
+                SELECT station_code, MAX(target_datetime) AS max_dt
+                FROM measurements
+                WHERE station_code IN ({placeholders}) AND target_datetime <= ?
+                GROUP BY station_code
+            ) latest ON m.station_code = latest.station_code AND m.target_datetime = latest.max_dt
+            WHERE m.station_code IN ({placeholders})
+        """
+        with sqlite3.connect(DB_PATH) as conn:
+            df = pd.read_sql_query(query, conn, params=(*codes, from_rounded.isoformat(), *codes))
 
-        if df is None or df.empty or actual_dt is None:
+        if df.empty:
             raise HTTPException(status_code=404, detail="Data not available.")
 
         data_list: List[HourlyStationPoint] = []
         for _, row in df.iterrows():
             point_dict = {
                 "station_id": _station_code_to_id(int(row["station_code"])),
+                "target_datetime": str(row["target_datetime"]),
                 "observed_datetime": str(row["observed_datetime"]),
             }
             for col in cols:
@@ -350,7 +348,6 @@ async def get_measurements(
         spec = {k: ITEMSPECS[k] for k in cols if k in ITEMSPECS}
         return HourlyResponse(
             target_datetime=from_rounded.isoformat(),
-            actual_datetime=actual_dt.isoformat(),
             data=data_list,
             spec=spec,
         )
@@ -551,3 +548,15 @@ COLLECT_LOG_HTML = """<!DOCTYPE html>
 async def collect_log_view():
     """collect.log をブラウザで閲覧するための簡易 HTML ビュー。5 分ごとに自動再取得。"""
     return Response(content=COLLECT_LOG_HTML, media_type="text/html; charset=utf-8")
+
+
+@router.get("/meta/ai-docs", response_class=Response)
+async def ai_docs():
+    """LLM / AI クライアント向けガイド (docs/ai-clients.md) を Markdown として返す。"""
+    if not AI_DOC_PATH.exists():
+        raise HTTPException(status_code=404, detail="ai-clients.md not found")
+    try:
+        content = AI_DOC_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Cannot read ai-clients.md: {e}")
+    return Response(content=content, media_type="text/markdown; charset=utf-8")

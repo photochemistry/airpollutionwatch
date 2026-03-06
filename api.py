@@ -8,6 +8,7 @@ import tomllib
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi_mcp import FastApiMCP
 
 from api_v1 import router as v1_router
@@ -46,6 +47,21 @@ app = FastAPI(
     description=APP_DESCRIPTION,
     version=project.get("project", {}).get("version", "0.0.0"),
 )
+
+# favicon.ico（漢字「氣」）を返すエンドポイント
+FAVICON_PATH = Path("/home/ubuntu/.cursor/projects/home-ubuntu-github-airpollutionwatch/assets/favicon-ki.png")
+APPLE_TOUCH_ICON_PATH = Path("/home/ubuntu/.cursor/projects/home-ubuntu-github-airpollutionwatch/assets/apple-touch-icon.png")
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse(FAVICON_PATH)
+
+
+@app.get("/apple-touch-icon.png")
+async def apple_touch_icon():
+    return FileResponse(APPLE_TOUCH_ICON_PATH)
+
 
 # CORS: API を呼び出す「ページ」のオリジン（スキーム+ホスト+ポート）。フロントを置くホストを列挙する。
 origins = [
