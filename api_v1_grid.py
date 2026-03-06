@@ -43,7 +43,7 @@ from stations_loader import get_stations_df
 # 日本全体をカバーする bounding box（沖縄〜北海道、対馬〜国後）
 JAPAN_BBOX = BoundingBox(min_lon=122.0, min_lat=24.0, max_lon=146.0, max_lat=46.0)
 
-AVAILABLE_ZOOM_LEVELS = [12, 14]
+AVAILABLE_ZOOM_LEVELS = [10, 11, 12, 13]
 AVAILABLE_METHODS = ["atps", "tps", "linear"]
 AVAILABLE_POLLUTANTS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
 DEFAULT_METHOD = "atps"
