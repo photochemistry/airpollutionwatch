@@ -95,6 +95,40 @@ app.include_router(v1_router)
 app.include_router(v1_grid_router)
 
 
+def _patch_uvicorn_invalid_request_logging() -> None:
+    """
+    uvicorn が「Invalid HTTP request received.」をログする際に、
+    例外の詳細（exc_info）も出すようにパッチする。
+    プロトコルパーサーエラーの原因（不正なリクエスト行・ボディの混入など）を確認しやすくする。
+    """
+    try:
+        import httptools
+        import uvicorn.protocols.http.httptools_impl as httptools_impl
+    except ImportError:
+        pass
+    else:
+
+        def _data_received_httptools(self, data: bytes) -> None:
+            self._unset_keepalive_if_required()
+            try:
+                self.parser.feed_data(data)
+            except httptools.HttpParserError as e:
+                msg = "Invalid HTTP request received."
+                self.logger.warning("%s %s", msg, e, exc_info=True)
+                self.send_400_response(msg)
+                return
+            except httptools.HttpParserUpgrade:
+                if self._should_upgrade():
+                    self.handle_websocket_upgrade()
+                else:
+                    self._unsupported_upgrade_warning()
+
+        httptools_impl.HttpToolsProtocol.data_received = _data_received_httptools
+
+    # h11_impl は handle_events が長いためここではパッチしない。
+    # 標準的には httptools が使われるため、上記の httptools パッチで多くの場合詳細が出力される。
+
+
 @app.on_event("startup")
 async def _setup_grid_logging() -> None:
     """uvicorn の logging 設定完了後に api_v1_grid ロガーを接続する."""
@@ -104,6 +138,12 @@ async def _setup_grid_logging() -> None:
         for handler in logging.getLogger("uvicorn").handlers:
             grid_logger.addHandler(handler)
         grid_logger.propagate = False
+
+
+# uvicorn が app をロードする前にプロトコルをパッチするため、uvicorn.run の直前に実行する
+# （__main__ で run する場合）。reload 時は子プロセスで app が再読込されるので、
+# モジュール読み込み時にパッチを当てておく。
+_patch_uvicorn_invalid_request_logging()
 
 
 if __name__ == "__main__":
