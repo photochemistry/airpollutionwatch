@@ -2,9 +2,18 @@
 API v1: 都道府県・測定局・測定データ・収集ログなどのエンドポイント。
 """
 import datetime
+import re
 import sqlite3
 from pathlib import Path
 from typing import List, Union, Literal, Dict, Any
+
+try:
+    from zoneinfo import ZoneInfo
+    JST = ZoneInfo("Asia/Tokyo")
+except ImportError:
+    JST = datetime.timezone(datetime.timedelta(hours=9))  # Python 3.8 用
+
+UTC = datetime.timezone.utc
 
 import pandas as pd
 import numpy as np
@@ -43,6 +52,7 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "airpollutionwatch.sqlite3"
 COLLECT_LOG_PATH = ROOT / "collect.log"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
+PREF_LINKS_PATH = ROOT / ".." / "airpollutionwatch" / "pref-links.md"
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
@@ -496,6 +506,171 @@ async def coverage():
     return Response(content="\n".join(html_parts), media_type="text/html; charset=utf-8")
 
 
+class CollectionStatusItem(BaseModel):
+    """県ごとの収集巡回状況（1件）"""
+    pref_id: str = Field(..., description="都道府県 ID")
+    name_ja: str = Field(..., description="都道府県名")
+    region: str = Field("", description="地域ブロック")
+    latest_datetime: str | None = Field(None, description="直近の target_datetime (ISO8601)。データなしのとき null")
+    hours_ago: float | None = Field(
+        None,
+        description="「最新1件」の target_datetime が今から何時間前か（鮮度）。収集が全県一括のため県どうしで同じになりやすい。",
+    )
+    oldest_continuous_datetime: str | None = Field(
+        None,
+        description="連続している区間の最古の target_datetime（1時間刻みで欠けなしにさかのぼれる限界）。データなしのとき null",
+    )
+    continuous_days_ago: float | None = Field(
+        None,
+        description="連続データが何日前までさかのぼれるか（日数）。県ごとに取得状況で異なる。",
+    )
+    has_data: bool = Field(..., description="当該県に測定データが1件以上あるか")
+    log_status: str = Field("ok", description="collect.log 上の状態: ok / warning / error")
+    log_message: str | None = Field(None, description="collect.log の該当県の WARNING/ERROR メッセージ（代表1件）")
+    pref_url: str | None = Field(None, description="当該県の公式データページ URL（pref-links.md 由来）")
+
+
+def _load_pref_links() -> Dict[str, str]:
+    """pref-links.md をパースし、県 ID → URL の辞書を返す。1行目はヘッダ、2行目以降は「県ID URL ...」形式。"""
+    path = PREF_LINKS_PATH.resolve()
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    result: Dict[str, str] = {}
+    for i, line in enumerate(text.splitlines()):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if i == 0 and parts and parts[0] == "県名":
+            continue
+        if len(parts) >= 2:
+            result[parts[0]] = parts[1]
+    return result
+
+
+def _collect_log_status_per_prefecture() -> Dict[str, tuple[str, str | None]]:
+    """collect.log を解析し、県ごとに「最悪のレベル」とその代表メッセージを返す。レベルは ok / warning / error。"""
+    if not COLLECT_LOG_PATH.exists():
+        return {}
+    try:
+        text = COLLECT_LOG_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    # 行の形式: 2026-03-08 15:00:01,540 WARNING Prefecture aichi: failed to collect: ...
+    level_re = re.compile(r",\d+\s+(WARNING|ERROR|CRITICAL)\s+Prefecture\s+(\w+):\s*(.*)")
+    # severity: 0=ok, 1=warning, 2=error
+    result: Dict[str, tuple[int, str]] = {}
+    for line in text.splitlines():
+        m = level_re.search(line)
+        if not m:
+            continue
+        level_name, pref, message = m.group(1), m.group(2), m.group(3).strip()
+        severity = 2 if level_name in ("ERROR", "CRITICAL") else 1
+        prev = result.get(pref, (0, ""))
+        if severity >= prev[0]:
+            result[pref] = (severity, message)
+    out: Dict[str, tuple[str, str | None]] = {}
+    for pref, (sev, msg) in result.items():
+        level = "error" if sev == 2 else "warning"
+        out[pref] = (level, msg if msg else None)
+    return out
+
+
+def _parse_db_datetime_utc(iso_str: str) -> datetime.datetime | None:
+    """DB の target_datetime を UTC の aware datetime で返す。ナイーブなら JST と解釈する。"""
+    try:
+        dt = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JST).astimezone(UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | None, float | None]:
+    """県の target_datetime 一覧から、最新から1時間刻みで連続している区間の最古を求め、その ISO 文字列と「何日前か」を返す。"""
+    cur.execute("SELECT DISTINCT target_datetime FROM measurements WHERE prefecture = ?", (pref,))
+    result = [r[0] for r in cur.fetchall()]
+    if not result:
+        return None, None
+    # ナイーブな場合は JST とみなし、UTC に統一して比較
+    dts_utc: list[datetime.datetime] = []
+    for s in result:
+        dt = _parse_db_datetime_utc(s)
+        if dt is not None:
+            dts_utc.append(dt)
+    if not dts_utc:
+        return None, None
+    dt_set = set(dts_utc)
+    latest = max(dts_utc)
+    cur_dt = latest
+    oldest = latest
+    one_hour = datetime.timedelta(hours=1)
+    while cur_dt in dt_set:
+        oldest = cur_dt
+        cur_dt -= one_hour
+    now = datetime.datetime.now(UTC)
+    delta_days = (now - oldest).total_seconds() / 86400.0
+    # 返す ISO は JST 表記で（表示用にそのまま DB の解釈を返すと分かりやすい）
+    oldest_jst = oldest.astimezone(JST)
+    return oldest_jst.isoformat(), round(delta_days, 1)
+
+
+@router.get("/log/status", response_model=List[CollectionStatusItem])
+async def log_status():
+    """各県の収集巡回状況を一覧で返す。collect.log が存在する場合は県ごとの状態（ok/warning/error）と代表メッセージを付与する。pref-links.md が存在する場合は県の公式URLを付与する。"""
+    now = datetime.datetime.now(UTC)
+    log_status_map = _collect_log_status_per_prefecture()
+    pref_links = _load_pref_links()
+    result: List[CollectionStatusItem] = []
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        for pref in sorted(prefecture_retrievers.keys()):
+            cur.execute(
+                "SELECT MAX(target_datetime) AS latest FROM measurements WHERE prefecture = ?",
+                (pref,),
+            )
+            row = cur.fetchone()
+            latest_iso = row[0] if row and row[0] else None
+            has_data = latest_iso is not None
+
+            hours_ago: float | None = None
+            if latest_iso:
+                latest_dt = _parse_db_datetime_utc(latest_iso)
+                if latest_dt is not None:
+                    delta = now - latest_dt
+                    hours_ago = round(delta.total_seconds() / 3600.0, 1)
+
+            oldest_iso, continuous_days_ago = _oldest_continuous_target(cur, pref)
+
+            level, message = log_status_map.get(pref, ("ok", None))
+
+            result.append(
+                CollectionStatusItem(
+                    pref_id=pref,
+                    name_ja=PREF_ID_TO_NAME.get(pref, pref),
+                    region=PREF_ID_TO_REGION.get(pref, ""),
+                    latest_datetime=latest_iso,
+                    hours_ago=hours_ago,
+                    oldest_continuous_datetime=oldest_iso,
+                    continuous_days_ago=continuous_days_ago,
+                    has_data=has_data,
+                    log_status=level,
+                    log_message=message,
+                    pref_url=pref_links.get(pref),
+                )
+            )
+
+    return result
+
+
 @router.get("/collect.log", response_class=Response)
 async def collect_log():
     """収集ジョブのログファイル collect.log の内容をプレーンテキストで返す。"""
@@ -512,32 +687,87 @@ COLLECT_LOG_HTML = """<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <title>collect.log</title>
+  <title>collect.log / 巡回状況</title>
   <style>
-    body { font-family: monospace; margin: 1rem; background: #1e1e1e; color: #d4d4d4; }
+    body { font-family: system-ui, sans-serif; margin: 1rem; background: #1e1e1e; color: #d4d4d4; }
+    h2 { font-size: 1rem; margin: 1rem 0 0.5rem; color: #d4d4d4; }
+    #status-table { border-collapse: collapse; font-size: 0.85rem; margin-bottom: 1rem; }
+    #status-table th, #status-table td { border: 1px solid #444; padding: 0.25rem 0.5rem; text-align: left; }
+    #status-table th { background: #333; }
+    #status-table tr:nth-child(even) { background: #252525; }
+    #status-table .no-data { color: #888; }
+    #status-table .hours-ago { font-variant-numeric: tabular-nums; }
+    #status-table .log-warn { color: #dcdc00; font-weight: bold; }
+    #status-table .log-err { color: #f14c4c; font-weight: bold; }
+    #status-table .log-msg { max-width: 28rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #status-table a.pref-link { color: #6fb3d8; text-decoration: none; }
+    #status-table a.pref-link:hover { text-decoration: underline; }
     #meta { margin-bottom: 0.5rem; font-size: 0.9rem; color: #858585; }
-    #log { white-space: pre-wrap; word-break: break-all; }
+    #log { white-space: pre-wrap; word-break: break-all; font-family: monospace; }
+    details#log-details pre { margin: 0.5rem 0 0; }
   </style>
 </head>
 <body>
-  <div id="meta">collect.log — <span id="updated">読み込み中…</span>（5分ごとに自動更新）</div>
-  <pre id="log"></pre>
+  <h2>各県の巡回状況</h2>
+  <div id="status-meta">読み込み中…</div>
+  <p id="status-legend" style="font-size: 0.85rem; color: #858585; margin: 0 0 0.5rem 0;">「最新の取得（経過）」＝最新1件の target_datetime が今から何時間前か（全県一括収集のため同じになりやすい）。「連続（さかのぼり）」＝1時間刻みで欠けなしに何日前までデータがあるか（県ごとに異なる）。</p>
+  <table id="status-table" aria-label="県別収集状況">
+    <thead><tr><th>県</th><th>地域</th><th>直近の target_datetime</th><th>最新の取得（経過）</th><th>連続データの最古</th><th>連続（さかのぼり）</th><th>状態</th><th>message</th></tr></thead>
+    <tbody id="status-body"></tbody>
+  </table>
+  <details id="log-details" style="margin-top: 1rem;">
+    <summary style="cursor: pointer;">collect.log（クリックで展開・5分ごとに自動更新）</summary>
+    <div id="meta" style="margin: 0.5rem 0; font-size: 0.9rem; color: #858585;">collect.log — <span id="updated">読み込み中…</span></div>
+    <pre id="log"></pre>
+  </details>
   <script>
     const PRELOAD_MINUTES = 5;
-    function load() {
-      fetch('collect.log')
+    function esc(s) {
+      if (s == null || s === '') return '';
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function loadStatus() {
+      fetch('/v1/log/status')
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(items => {
+          const tbody = document.getElementById('status-body');
+          tbody.innerHTML = items.map(it => {
+            const latest = it.latest_datetime ? it.latest_datetime.replace('T', ' ').slice(0, 19) : '—';
+            const hours = it.hours_ago != null ? it.hours_ago + ' 時間前' : '—';
+            const oldest = it.oldest_continuous_datetime ? it.oldest_continuous_datetime.replace('T', ' ').slice(0, 19) : '—';
+            const days = it.continuous_days_ago != null ? it.continuous_days_ago + ' 日前まで' : '—';
+            let statusCell = '正常';
+            if (it.log_status === 'warning') statusCell = '<span class="log-warn">WARN</span>';
+            else if (it.log_status === 'error') statusCell = '<span class="log-err">ERROR</span>';
+            const msg = it.log_message != null ? esc(it.log_message) : '—';
+            const rowClass = it.has_data ? '' : ' class="no-data"';
+            const nameCell = it.pref_url
+              ? '<a href="' + esc(it.pref_url) + '" target="_blank" rel="noopener noreferrer" class="pref-link">' + esc(it.name_ja) + '</a>'
+              : esc(it.name_ja);
+            return '<tr' + rowClass + '><td>' + nameCell + '</td><td>' + it.region + '</td><td>' + latest + '</td><td class="hours-ago">' + hours + '</td><td>' + oldest + '</td><td class="hours-ago">' + days + '</td><td>' + statusCell + '</td><td class="log-msg" title="' + esc(it.log_message || '') + '">' + msg + '</td></tr>';
+          }).join('');
+          document.getElementById('status-meta').textContent = '最終取得: ' + new Date().toLocaleString('ja-JP');
+        })
+        .catch(e => {
+          document.getElementById('status-body').innerHTML = '<tr><td colspan="8">取得できませんでした: ' + esc(e.message) + '</td></tr>';
+          document.getElementById('status-meta').textContent = 'エラー';
+        });
+    }
+    function loadLog() {
+      fetch('/v1/collect.log')
         .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
         .then(t => {
           document.getElementById('log').textContent = t;
-          document.getElementById('updated').textContent = '最終更新: ' + new Date().toLocaleString('ja-JP');
+          document.getElementById('updated').textContent = new Date().toLocaleString('ja-JP');
         })
         .catch(e => {
           document.getElementById('log').textContent = '取得できませんでした: ' + e.message;
           document.getElementById('updated').textContent = 'エラー';
         });
     }
-    load();
-    setInterval(load, PRELOAD_MINUTES * 60 * 1000);
+    loadStatus();
+    loadLog();
+    setInterval(loadLog, PRELOAD_MINUTES * 60 * 1000);
   </script>
 </body>
 </html>

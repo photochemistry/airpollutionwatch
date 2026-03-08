@@ -1,14 +1,17 @@
 """
 airpollutionwatch API エントリポイント。
 v1 エンドポイントは api_v1 に定義し、/v1 にマウントしています。
+同一ポートで dashboard（Svelte）を配信するため、/ に静的ファイルをマウントし、
+API に該当しないパスは SPA 用に index.html を返します。
 """
 from pathlib import Path
 import tomllib
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi_mcp import FastApiMCP
 
 import logging
@@ -17,6 +20,7 @@ from api_v1 import router as v1_router
 from api_v1_grid import router as v1_grid_router
 
 ROOT = Path(__file__).resolve().parent
+DASHBOARD_DIST = ROOT / "dashboard" / "dist"
 with open(ROOT / "pyproject.toml", "rb") as f:
     project = tomllib.load(f)
 
@@ -37,7 +41,8 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 - `GET /v1/stations/{station_id}` — 局詳細
 - `GET /v1/latest` — 指定局または県内の直近最新値
 - `GET /v1/coverage` — 県別の連続データ期間（HTML）
-- `GET /v1/collect.log` / `GET /v1/log` — 収集ジョブログ（テキスト／HTML）
+- `GET /v1/collect.log` / `GET /v1/log` — 収集ジョブログ（テキスト／HTML）。`/v1/log` は各県の巡回状況一覧付き
+- `GET /v1/log/status` — 各県の収集巡回状況（直近 target_datetime・経過時間）を JSON で返す
 
 ## グリッドエンドポイント（v1/grid）
 
@@ -93,6 +98,28 @@ mcp.mount()
 
 app.include_router(v1_router)
 app.include_router(v1_grid_router)
+
+# dashboard（Svelte ビルド）を同一ポートで配信
+if DASHBOARD_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=DASHBOARD_DIST / "assets"), name="dashboard_assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_dashboard(request: Request, full_path: str):
+        """API 以外のパスは静的ファイルまたは SPA 用 index.html を返す"""
+        if full_path.startswith("v1/") or full_path == "v1":
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Not Found")
+        if full_path.startswith("assets/"):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Not Found")
+        file_path = DASHBOARD_DIST / full_path
+        if full_path and file_path.is_file():
+            return FileResponse(file_path)
+        index_path = DASHBOARD_DIST / "index.html"
+        if index_path.is_file():
+            return FileResponse(index_path)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Dashboard not built. Run: cd dashboard && npm run build")
 
 
 def _patch_uvicorn_invalid_request_logging() -> None:

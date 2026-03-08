@@ -44,6 +44,21 @@ poetry run python api.py
 デフォルトでは `http://0.0.0.0:8089` で待ち受けます。  
 ブラウザで `http://localhost:8089/docs` にアクセスすると、Swagger UI が利用できます。
 
+### 3. ダッシュボードを同一ポートで配信する場合（オプション）
+
+神奈川県 OX 監視用の Svelte ダッシュボードを、API と同じ 8089 番ポートで配信できます。
+
+```bash
+cd dashboard && npm ci && npm run build && cd ..
+poetry run python api.py
+```
+
+- **API**: `https://andersan.net:8089/v1/...`
+- **ダッシュボード**: `https://andersan.net:8089/`（ルート）
+- **API ドキュメント**: `https://andersan.net:8089/docs`
+
+ビルド時は `VITE_API_BASE_URL` を未設定のままにすると、本番でも同一オリジン（相乗り）として `/v1/...` にリクエストします。
+
 ---
 
 ## エンドポイント一覧

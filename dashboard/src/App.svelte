@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import Plotly from 'plotly.js-dist-min';
   import {
     fetchLatest,
@@ -12,7 +12,7 @@
     type TimeSeriesResponse,
   } from './lib/api';
   import { getOxLevel, OX_THRESHOLDS, OX_LEVEL_LABELS, type OxLevel } from './lib/constants';
-  import MapOxOverlay from './lib/MapOxOverlay.svelte';
+  import type { GridFieldResponse } from './lib/api';
 
   const PREF = 'kanagawa';
 
@@ -26,8 +26,19 @@
   let error: string | null = null;
   let lastFetched: Date | null = null;
   let plotDiv: HTMLDivElement | null = null;
-  let gridFieldData: import('./lib/api').GridFieldResponse | null = null;
+  let mapPlotDiv: HTMLDivElement | null = null;
+  let debugPlot3Div: HTMLDivElement | null = null;
+  let gridFieldData: GridFieldResponse | null = null;
+  /** 神奈川県輪郭 [lon, lat][]（GeoJSON から取得、取得失敗時は bbox 矩形） */
+  let kanagawaOutline: [number, number][] = [];
+  /** 地図グラデーション用 Canvas の data URL（Plotly で表示されない場合の img 用） */
+  let mapGradientDataUrl: string | null = null;
   const KANAGAWA_BBOX = '138.9,35.1,139.85,35.7';
+  const KANAGAWA_BBOX_NUM = { minLon: 138.9, minLat: 35.1, maxLon: 139.85, maxLat: 35.7 };
+  /** true のとき地図の代わりに sin(x)*cos(y) のテストプロットを表示（問題切り分け用） */
+  const DEBUG_PLOT = false;
+  /** true のとき xy は神奈川範囲・z は sin(x)*cos(y) で heatmap を表示（ログ・グラフの切り分け用） */
+  const DEBUG_HEATMAP_SINCOS = false;
 
   function normalizeStationId(id: string): string {
     const n = id.replace(/\D/g, '');
@@ -113,17 +124,24 @@
       lastFetched = new Date();
       if (latestRes.datetime) {
         try {
-          gridFieldData = await fetchGridField(KANAGAWA_BBOX, 'ox', latestRes.datetime, 12, 'atps', '0.007');
-        } catch {
+          gridFieldData = await fetchGridField(KANAGAWA_BBOX, 'ox', latestRes.datetime, 13, 'atps', '0.007');
+          const v = gridFieldData?.values;
+          console.log('[load] gridField 取得成功 values.length=', v?.length ?? 0, 'values[0]?.length=', Array.isArray(v?.[0]) ? (v[0] as unknown[]).length : '-');
+        } catch (e) {
           gridFieldData = null;
+          console.warn('[load] gridField 取得失敗', e);
         }
       } else {
         gridFieldData = null;
+        console.log('[load] latestRes.datetime がないため gridField は取得しません');
       }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
+      // データ取得後に地図を再描画（リアクティブが先に走って null で描画されることがあるため）
+      await tick();
+      if (mapPlotDiv) drawMapPlotly();
     }
   }
 
@@ -228,7 +246,424 @@
     drawPlotly();
   }
 
-  onMount(() => { load(); });
+  /** タイル座標 (x,y) @ zoom を経緯度 [lon, lat] に変換 */
+  function tileXYToLonLat(x: number, y: number, zoom: number): [number, number] {
+    const n = 2 ** zoom;
+    const lon = (x / n) * 360 - 180;
+    const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+    const lat = (180 / Math.PI) * latRad;
+    return [lon, lat];
+  }
+
+  const REF_PPB = 120;
+
+  function valueToRgbaRelative(v: number | null, vMin: number, vMax: number): string {
+    if (v == null || Number.isNaN(v)) return 'rgba(200,200,200,0.4)';
+    const range = vMax - vMin;
+    const t = range > 0 ? Math.max(0, Math.min(1, (v - vMin) / range)) : 0;
+    const a = 0.85;
+    let r: number, g: number, b: number;
+    if (t <= 0.25) {
+      const s = t / 0.25;
+      r = 34 + s * (76 - 34);
+      g = 139 + s * (175 - 139);
+      b = 34 + s * (74 - 34);
+    } else if (t <= 0.5) {
+      const s = (t - 0.25) / 0.25;
+      r = 76 + s * (255 - 76);
+      g = 175 + s * (235 - 175);
+      b = 74 + s * (59 - 74);
+    } else if (t <= 0.75) {
+      const s = (t - 0.5) / 0.25;
+      r = 255;
+      g = 235 + s * (224 - 235);
+      b = 59 + s * (170 - 59);
+    } else {
+      const s = (t - 0.75) / 0.25;
+      r = 255;
+      g = 224 - s * 224;
+      b = 170 - s * 170;
+    }
+    return `rgba(${Math.round(r)},${Math.round(g)},${Math.round(b)},${a})`;
+  }
+
+  /** グリッドを Canvas で描画し、Plotly image 用の data URL と範囲を返す。 */
+  function gridToImageTrace(
+    data: GridFieldResponse,
+    displayMultiplier: number
+  ): { source: string; x0: number; y0: number; dx: number; dy: number } | null {
+    const { values, tile_x_min, tile_x_max, tile_y_min, tile_y_max, z: zoom } = data;
+    const nx = tile_x_max - tile_x_min + 1;
+    const ny = tile_y_max - tile_y_min + 1;
+    if (nx < 1 || ny < 1 || !values?.length || !values[0]?.length) return null;
+    const getVal = (row: number, col: number): number | null => {
+      const v = values[row]?.[col];
+      if (v == null || Number.isNaN(v)) return null;
+      return v * displayMultiplier;
+    };
+    let vMin = Infinity;
+    let vMax = -Infinity;
+    for (let row = 0; row < ny; row++) {
+      for (let col = 0; col < nx; col++) {
+        const val = getVal(row, col);
+        if (val != null) {
+          vMin = Math.min(vMin, val);
+          vMax = Math.max(vMax, val);
+        }
+      }
+    }
+    if (vMin > vMax) {
+      vMin = 0;
+      vMax = REF_PPB;
+    } else if (vMin === vMax) {
+      vMin = Math.max(0, vMin - 5);
+      vMax = vMax + 5;
+    }
+    const [westLon, southLat] = tileXYToLonLat(tile_x_min + 0.5, tile_y_max + 0.5, zoom);
+    const [eastLon, northLat] = tileXYToLonLat(tile_x_max + 0.5, tile_y_min + 0.5, zoom);
+    const canvas = document.createElement('canvas');
+    canvas.width = nx;
+    canvas.height = ny;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    for (let row = 0; row < ny; row++) {
+      for (let col = 0; col < nx; col++) {
+        const val = getVal(row, col);
+        ctx.fillStyle = valueToRgbaRelative(val, vMin, vMax);
+        ctx.fillRect(col, row, 1, 1);
+      }
+    }
+    const dx = (eastLon - westLon) / nx;
+    const dy = (northLat - southLat) / ny;
+    return {
+      source: canvas.toDataURL('image/png'),
+      x0: westLon + dx / 2,
+      y0: southLat + dy / 2,
+      dx,
+      dy,
+    };
+  }
+
+  async function loadKanagawaOutline(): Promise<void> {
+    try {
+      const base = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? '/';
+      const r = await fetch(`${base}kanagawa-outline.json`);
+      if (!r.ok) throw new Error(String(r.status));
+      const geojson = await r.json();
+      const coords = geojson?.geometry?.coordinates?.[0];
+      if (Array.isArray(coords) && coords.length > 0) {
+        kanagawaOutline = coords.map((c: number[]) => [c[0], c[1]] as [number, number]);
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    kanagawaOutline = [
+      [KANAGAWA_BBOX_NUM.minLon, KANAGAWA_BBOX_NUM.minLat],
+      [KANAGAWA_BBOX_NUM.maxLon, KANAGAWA_BBOX_NUM.minLat],
+      [KANAGAWA_BBOX_NUM.maxLon, KANAGAWA_BBOX_NUM.maxLat],
+      [KANAGAWA_BBOX_NUM.minLon, KANAGAWA_BBOX_NUM.maxLat],
+      [KANAGAWA_BBOX_NUM.minLon, KANAGAWA_BBOX_NUM.minLat],
+    ];
+  }
+
+  /** グリッド API 応答を Plotly heatmap 用の x, y, z に変換。API は values[0]=南。values が 1次元の場合は row-major で 2次元に組み直す。 */
+  function gridToHeatmapData(
+    data: GridFieldResponse,
+    displayMultiplier: number
+  ): { x: number[]; y: number[]; z: number[][] } | null {
+    const { tile_x_min, tile_x_max, tile_y_min, tile_y_max, z: zoom } = data;
+    let values = data.values;
+    const valuesLen = values == null ? 0 : (Array.isArray(values) ? values.length : (values as unknown as ArrayLike<unknown>).length);
+    const firstRowLen = values != null && values[0] != null && Array.isArray(values[0]) ? (values[0] as unknown[]).length : null;
+    console.log('[gridToHeatmapData] 呼び出し: valuesLen=', valuesLen, 'firstRowLen=', firstRowLen, 'tile_x=', tile_x_min, '..', tile_x_max, 'tile_y=', tile_y_min, '..', tile_y_max);
+    if (values == null) {
+      console.warn('[gridToHeatmapData] values が null のため null を返します');
+      return null;
+    }
+    if (!Array.isArray(values)) values = Array.from(values as unknown as ArrayLike<unknown>);
+    const nx = tile_x_max - tile_x_min + 1;
+    const ny = tile_y_max - tile_y_min + 1;
+    if (nx < 1 || ny < 1) {
+      console.warn('[gridToHeatmapData] nx または ny が 0 以下のため null を返します nx=', nx, 'ny=', ny);
+      return null;
+    }
+
+    const expectedLen = nx * ny;
+    const firstRow = values[0];
+    const is2d = Array.isArray(firstRow);
+    let rows: (number | null)[][];
+
+    if (is2d && values.length === ny) {
+      rows = (values as (number | null)[][]).map((rawRow) => {
+        const rowArr = Array.isArray(rawRow) ? rawRow : [];
+        return Array.from({ length: nx }, (_, col) => {
+          const v = rowArr[col];
+          const n = Number(v);
+          return typeof n === 'number' && !Number.isNaN(n) ? n : null;
+        });
+      });
+    } else if (is2d && values.length > 0) {
+      const flat = (values as (number | null)[][]).flat();
+      if (flat.length === expectedLen) {
+        rows = [];
+        for (let row = 0; row < ny; row++) {
+          const r: (number | null)[] = [];
+          for (let col = 0; col < nx; col++) {
+            const v = flat[row * nx + col];
+            const n = Number(v);
+            r.push(typeof n === 'number' && !Number.isNaN(n) ? n : null);
+          }
+          rows.push(r);
+        }
+        console.log('[gridToHeatmapData] values 2次元だが行数が ny と異なるため flat で再構成しました');
+      } else {
+        console.warn('[gridToHeatmapData] values の形状が想定外: length=', values.length, 'is2d=', is2d, 'ny=', ny, 'nx=', nx);
+        return null;
+      }
+    } else if (!is2d && typeof firstRow === 'number' && values.length === expectedLen) {
+      const flat = values as (number | null)[];
+      rows = [];
+      for (let row = 0; row < ny; row++) {
+        const r: (number | null)[] = [];
+        for (let col = 0; col < nx; col++) {
+          const v = flat[row * nx + col];
+          const n = Number(v);
+          r.push(typeof n === 'number' && !Number.isNaN(n) ? n : null);
+        }
+        rows.push(r);
+      }
+      console.log('[gridToHeatmapData] values を 1次元から 2次元に変換しました (row-major, ny*nx=', ny * nx, ')');
+    } else if (!is2d && values.length >= expectedLen) {
+      const flat = Array.from(values as ArrayLike<unknown>);
+      rows = [];
+      for (let row = 0; row < ny; row++) {
+        const r: (number | null)[] = [];
+        for (let col = 0; col < nx; col++) {
+          const v = flat[row * nx + col];
+          const n = Number(v);
+          r.push(typeof n === 'number' && !Number.isNaN(n) ? n : null);
+        }
+        rows.push(r);
+      }
+      console.log('[gridToHeatmapData] values を 1次元風から 2次元に変換しました length=', flat.length, 'expected=', expectedLen);
+    } else {
+      console.warn('[gridToHeatmapData] values の形状が想定外: length=', values.length, 'is2d=', is2d, 'ny=', ny, 'nx=', nx);
+      return null;
+    }
+
+    const x: number[] = [];
+    const y: number[] = [];
+    for (let col = 0; col < nx; col++) {
+      const [lon] = tileXYToLonLat(tile_x_min + col + 0.5, tile_y_min + 0.5, zoom);
+      x.push(lon);
+    }
+    for (let row = 0; row < ny; row++) {
+      const [, lat] = tileXYToLonLat(tile_x_min + 0.5, tile_y_max + 0.5 - row, zoom);
+      y.push(lat);
+    }
+    const z: number[][] = rows.map((row) =>
+      row.map((v) => (v != null ? v * displayMultiplier : 0))
+    );
+    const zFlat = z.flat();
+    const sample = zFlat.filter((v) => v > 0);
+    const zMin = zFlat.length ? Math.min(...zFlat) : 0;
+    const zMax = zFlat.length ? Math.max(...zFlat) : 0;
+    console.log(
+      '[gridToHeatmapData] nx=', nx, 'ny=', ny,
+      'nonZero=', sample.length, 'zMin=', zMin.toFixed(1), 'zMax=', zMax.toFixed(1)
+    );
+    return { x, y, z };
+  }
+
+  /** デバッグ用: sin(x)*cos(y) の 2D 配列を生成（x,y は 0〜2π） */
+  function makeSinCosData(): { x: number[]; y: number[]; z: number[][] } {
+    const n = 40;
+    const x: number[] = [];
+    const y: number[] = [];
+    for (let i = 0; i < n; i++) {
+      x.push((i / (n - 1)) * 2 * Math.PI);
+      y.push((i / (n - 1)) * 2 * Math.PI);
+    }
+    const z: number[][] = [];
+    for (let i = 0; i < n; i++) {
+      const row: number[] = [];
+      for (let j = 0; j < n; j++) {
+        row.push(Math.sin(x[j]) * Math.cos(y[i]));
+      }
+      z.push(row);
+    }
+    return { x, y, z };
+  }
+
+  /** 神奈川県の xy 範囲で z = sin(x)*cos(y) を 0〜250 にスケールした heatmap 用データ */
+  function makeKanagawaSinCosData(): { x: number[]; y: number[]; z: number[][] } {
+    const nx = 40;
+    const ny = 30;
+    const { minLon, maxLon, minLat, maxLat } = KANAGAWA_BBOX_NUM;
+    const x: number[] = [];
+    const y: number[] = [];
+    for (let j = 0; j < nx; j++) {
+      x.push(minLon + (j / (nx - 1)) * (maxLon - minLon));
+    }
+    for (let i = 0; i < ny; i++) {
+      y.push(minLat + (i / (ny - 1)) * (maxLat - minLat));
+    }
+    const z: number[][] = [];
+    for (let i = 0; i < ny; i++) {
+      const row: number[] = [];
+      for (let j = 0; j < nx; j++) {
+        const v = Math.sin(x[j]) * Math.cos(y[i]); // [-1, 1]
+        row.push((v + 1) * 125); // [0, 250] で colorscale に合わせる
+      }
+      z.push(row);
+    }
+    return { x, y, z };
+  }
+
+  function drawMapPlotly(): void {
+    if (!mapPlotDiv) return;
+
+    if (DEBUG_PLOT) {
+      const { x, y, z } = makeSinCosData();
+      const traces2d = [
+        {
+          x,
+          y,
+          z,
+          type: 'heatmap',
+          colorscale: 'RdBu',
+          zmin: -1,
+          zmax: 1,
+        },
+      ];
+      const layout2d = {
+        title: { text: 'デバッグ: sin(x)*cos(y) (2D heatmap)' },
+        xaxis: { title: 'x' },
+        yaxis: { title: 'y', scaleanchor: 'x' },
+        margin: { t: 40, r: 24, b: 40, l: 52 },
+        height: 420,
+      };
+      Plotly.react(mapPlotDiv, traces2d, layout2d, { responsive: true, displayModeBar: true });
+      if (debugPlot3Div) {
+        const traces3d = [
+          {
+            x,
+            y,
+            z,
+            type: 'surface',
+            colorscale: 'RdBu',
+            zmin: -1,
+            zmax: 1,
+          },
+        ];
+        const layout3d = {
+          title: { text: 'デバッグ: sin(x)*cos(y) (3D surface)' },
+          margin: { t: 40, r: 24, b: 40, l: 52 },
+          height: 420,
+          scene: {
+            xaxis: { title: 'x' },
+            yaxis: { title: 'y' },
+            zaxis: { title: 'z' },
+          },
+        };
+        Plotly.react(debugPlot3Div, traces3d, layout3d, { responsive: true, displayModeBar: true });
+      }
+      return;
+    }
+
+    const heatmapData = DEBUG_HEATMAP_SINCOS
+      ? makeKanagawaSinCosData()
+      : (gridFieldData ? gridToHeatmapData(gridFieldData, OX_DISPLAY_MULTIPLIER) : null);
+    mapGradientDataUrl = null;
+    const traces: Record<string, unknown>[] = [];
+    if (heatmapData) {
+      const x = heatmapData.x.slice();
+      const y = heatmapData.y.slice();
+      const z = heatmapData.z.map((row) => row.slice());
+      if (DEBUG_HEATMAP_SINCOS) {
+        console.log('[drawMapPlotly] DEBUG_HEATMAP_SINCOS: Kanagawa xy + sin(x)*cos(y), x.len=', x.length, 'y.len=', y.length);
+      } else {
+        console.log('[drawMapPlotly] adding heatmap trace, traces.length will be', traces.length + 1);
+      }
+      const colorscale: [number, string][] = [
+        [0, 'rgb(34,139,34)'],
+        [0.25, 'rgb(76,175,74)'],
+        [0.5, 'rgb(255,235,59)'],
+        [0.75, 'rgb(255,152,0)'],
+        [1, 'rgb(227,26,28)'],
+      ];
+      traces.push({
+        x,
+        y,
+        z,
+        type: 'contour',
+        zmin: 0,
+        zmax: 250,
+        colorscale,
+        colorbar: { title: 'OX (ppb)' },
+        contours: {
+          showlabels: true,
+          showlines: true,
+          coloring: 'heatmap',
+        },
+      });
+    } else {
+      if (gridFieldData) {
+        console.warn('[drawMapPlotly] no heatmapData ですが gridFieldData はあります。上記 [gridToHeatmapData] のログで原因を確認してください。');
+      } else {
+        console.log('[drawMapPlotly] no heatmapData (gridFieldData が null＝API 未取得または取得失敗)');
+      }
+    }
+    if (kanagawaOutline.length > 0) {
+      const lons = kanagawaOutline.map((c) => c[0]);
+      const lats = kanagawaOutline.map((c) => c[1]);
+      traces.push({
+        x: lons,
+        y: lats,
+        type: 'scatter',
+        mode: 'lines',
+        line: { color: '#333', width: 2 },
+        fill: 'none',
+        showlegend: false,
+      });
+    }
+    const layout = {
+      xaxis: {
+        title: '経度',
+        range: [KANAGAWA_BBOX_NUM.minLon, KANAGAWA_BBOX_NUM.maxLon] as [number, number],
+        constrain: 'domain',
+      },
+      yaxis: {
+        title: '緯度',
+        range: [KANAGAWA_BBOX_NUM.minLat, KANAGAWA_BBOX_NUM.maxLat] as [number, number],
+        scaleanchor: 'x',
+        scaleratio: 1,
+      },
+      margin: { t: 24, r: 24, b: 40, l: 52 },
+      height: 420,
+      showlegend: false,
+    };
+    Plotly.react(mapPlotDiv, traces, layout, { responsive: true, displayModeBar: true });
+    requestAnimationFrame(() => {
+      if (mapPlotDiv && typeof Plotly.Plots?.resize === 'function') Plotly.Plots.resize(mapPlotDiv);
+    });
+    setTimeout(() => {
+      if (mapPlotDiv && typeof Plotly.Plots?.resize === 'function') Plotly.Plots.resize(mapPlotDiv);
+    }, 300);
+  }
+
+  $: if (mapPlotDiv) {
+    void gridFieldData;
+    void kanagawaOutline.length;
+    void debugPlot3Div;
+    drawMapPlotly();
+  }
+
+  onMount(() => {
+    load();
+    loadKanagawaOutline();
+  });
 </script>
 
 <main class="dashboard">
@@ -252,11 +687,28 @@
 
   <div class="charts-row">
     <section class="section map-section">
-      <h2>神奈川県 OX 分布（補間マップ）</h2>
+      <h2>神奈川県 OX 分布（補間・等高線）</h2>
+      {#if latest?.datetime}
+        <p class="map-datetime">対象時刻: {latest.datetime}</p>
+      {/if}
       {#if latest && !gridFieldData && !loading}
         <p class="muted">グリッドデータを取得できませんでした（API /v1/grid/field を確認してください）。</p>
       {/if}
-      <MapOxOverlay gridData={gridFieldData} datetimeLabel={latest?.datetime ?? ''} displayMultiplier={OX_DISPLAY_MULTIPLIER} />
+      <div class="plotly-map-wrap">
+        {#if DEBUG_PLOT}
+          <p class="muted">DEBUG_PLOT=true: sin(x)*cos(y) で Plotly の表示を確認しています。</p>
+        {:else if DEBUG_HEATMAP_SINCOS}
+          <p class="muted">DEBUG_HEATMAP_SINCOS=true: xy は神奈川範囲・z は sin(x)*cos(y) のテスト表示です。</p>
+          <div class="plotly-container plotly-map" bind:this={mapPlotDiv}></div>
+          <div class="plotly-container plotly-debug3" bind:this={debugPlot3Div}></div>
+        {:else}
+          {#if mapGradientDataUrl}
+            <img class="map-gradient-img" src={mapGradientDataUrl} alt="OX分布" />
+          {/if}
+          <div class="plotly-container plotly-map" bind:this={mapPlotDiv}></div>
+        {/if}
+      </div>
+      <p class="map-legend">階調: 低（緑）→ 高（赤）。枠線は神奈川県の範囲です。</p>
     </section>
     <section class="section timeseries">
       <h2>過去24時間の OX 推移（1時間値）</h2>
@@ -413,6 +865,32 @@
   .data-table tr.level-severe .ox { color: #b71c1c; }
   .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
   .station-name { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .map-datetime { margin: 0 0 0.5rem 0; font-size: 0.9rem; color: #555; }
+  .map-legend { margin: 0.5rem 0 0; font-size: 0.8rem; color: #666; }
+  .plotly-map-wrap {
+    position: relative;
+    height: 420px;
+    min-height: 420px;
+  }
+  .plotly-map-wrap .map-gradient-img {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: fill;
+    pointer-events: none;
+    z-index: 0;
+  }
+  .plotly-map-wrap .plotly-map {
+    position: relative;
+    z-index: 1;
+    min-height: 420px;
+  }
+  .plotly-map-wrap .plotly-debug3 {
+    margin-top: 1rem;
+    min-height: 420px;
+  }
   .section.timeseries {
     overflow: hidden;
     max-width: 100%;

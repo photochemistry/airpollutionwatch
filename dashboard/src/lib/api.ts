@@ -1,15 +1,15 @@
 /**
  * airpollutionwatch API クライアント
  * - 開発時: 同じオリジンへ /api でリクエストし、Vite がプロキシで API に転送（CORS 回避）
- * - 本番: VITE_API_BASE_URL または https://andersan.net:8089 に直接リクエスト
+ * - 本番: VITE_API_BASE_URL が空なら同一オリジン（FastAPI 相乗り）、指定時はその URL にリクエスト
  */
 
 const BASE =
   import.meta.env.DEV
     ? '/api'
-    : (typeof import.meta.env.VITE_API_BASE_URL === 'string'
+    : (typeof import.meta.env.VITE_API_BASE_URL === 'string' && import.meta.env.VITE_API_BASE_URL
         ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '')
-        : 'https://andersan.net:8089');
+        : '');
 
 export interface LatestStationValues {
   station_id: string;
@@ -50,7 +50,10 @@ export interface TimeSeriesResponse {
 
 async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
   const isDev = import.meta.env.DEV;
-  const baseUrl = isDev && typeof location !== 'undefined' ? location.origin : BASE;
+  const baseUrl =
+    isDev && typeof location !== 'undefined'
+      ? location.origin
+      : BASE || (typeof location !== 'undefined' ? location.origin : 'https://andersan.net:8089');
   const pathStr = isDev ? '/api' + path : path;
   const url = new URL(pathStr, baseUrl);
   if (params) {

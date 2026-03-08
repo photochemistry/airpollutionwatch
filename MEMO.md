@@ -1,0 +1,3 @@
+- atpsの柔軟性パラメータを指定できるようにしたい。
+- grid/fieldの実装。
+- collect_hourly の 404 対策: airpollutionwatch の `system/hourly_path_json.py` で、404 時に「前日24時→当日00時」「2桁時→1桁時」の代替 URL をリトライするように変更済み。
