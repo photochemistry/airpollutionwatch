@@ -11,6 +11,39 @@ const BASE =
         ? import.meta.env.VITE_API_BASE_URL.replace(/\/$/, '')
         : '');
 
+/** 本番で BASE が http なのにページが https だと Mixed Content でブロックされるため、同一ホストならページのオリジンを使う */
+function resolveBaseUrl(): string {
+  if (import.meta.env.DEV && typeof location !== 'undefined') return location.origin;
+  const base = BASE || (typeof location !== 'undefined' ? location.origin : '');
+  if (typeof location !== 'undefined' && base && location.origin) {
+    try {
+      const baseUrl = new URL(base);
+      const pageOrigin = new URL(location.origin);
+      if (baseUrl.host === pageOrigin.host && baseUrl.protocol !== pageOrigin.protocol)
+        return location.origin;
+    } catch {
+      /* ignore */
+    }
+  }
+  return base;
+}
+
+/** 指定 path へのリクエスト URL（デバッグ用） */
+export function getApiUrl(path: string, params?: Record<string, string>): string {
+  const baseUrl = resolveBaseUrl();
+  const pathStr = import.meta.env.DEV ? '/api' + path : path;
+  const url = new URL(pathStr, baseUrl || 'http://localhost');
+  if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  return url.toString();
+}
+
+export interface PrefectureInfo {
+  id: string;
+  name_ja: string;
+  has_data: boolean;
+  region: string;
+}
+
 export interface LatestStationValues {
   station_id: string;
   values: Record<string, number | null>;
@@ -49,19 +82,20 @@ export interface TimeSeriesResponse {
 }
 
 async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
-  const isDev = import.meta.env.DEV;
-  const baseUrl =
-    isDev && typeof location !== 'undefined'
-      ? location.origin
-      : BASE || (typeof location !== 'undefined' ? location.origin : 'https://andersan.net:8089');
-  const pathStr = isDev ? '/api' + path : path;
-  const url = new URL(pathStr, baseUrl);
+  const baseUrl = resolveBaseUrl();
+  const pathStr = import.meta.env.DEV ? '/api' + path : path;
+  const url = new URL(pathStr, baseUrl || 'http://localhost');
   if (params) {
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
   }
   const res = await fetch(url.toString());
   if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
   return res.json() as Promise<T>;
+}
+
+/** 都道府県一覧（id, name_ja, has_data, region） */
+export async function fetchPrefectures(): Promise<PrefectureInfo[]> {
+  return get<PrefectureInfo[]>('/v1/prefectures');
 }
 
 /** 都道府県の最新値（局ごと） */
@@ -96,6 +130,24 @@ export async function fetchMeasurementsSeries(
     pollutants,
     format: 'series',
   });
+}
+
+/** 神奈川県輪郭 GeoJSON（API 経由で CORS 回避） */
+export async function fetchKanagawaGeoJSON(): Promise<{
+  type: string;
+  features: Array<{ type: string; properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } }>;
+}> {
+  return get<{ type: string; features: Array<{ type: string; properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } }> }>('/v1/geojson/kanagawa');
+}
+
+/** 指定都道府県の輪郭（簡略化済み rings）と輪郭から算出した bbox。県単位で取得するため軽量。 */
+export interface PrefectureOutlineResponse {
+  rings: [number, number][][];
+  /** [minLon, minLat, maxLon, maxLat]。輪郭から事前計算済み。 */
+  bbox?: [number, number, number, number];
+}
+export async function fetchPrefectureOutline(prefId: string): Promise<PrefectureOutlineResponse> {
+  return get<PrefectureOutlineResponse>(`/v1/geojson/outline/${prefId}`);
 }
 
 /** グリッド field（bbox 内の補間値・地図オーバーレイ用） */
