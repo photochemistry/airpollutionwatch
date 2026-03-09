@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount, onDestroy, tick } from 'svelte';
   import Plotly from 'plotly.js-dist-min';
   import type { GridFieldResponse } from './api';
   import type { LatestRow, BBox } from './types';
@@ -347,16 +348,33 @@
       : (gridFieldData ? gridToHeatmapData(gridFieldData, oxDisplayMultiplier) : null);
     mapGradientDataUrl = null;
     const traces: Record<string, unknown>[] = [];
+
+    /** 等高線・ヒートマップのスケールはこの範囲にクランプ（1局の異常値で全国が崩れないように） */
+    const MAP_OX_SCALE_MAX = 500;
     const oxValues = latestWithNames
       .map((r) => r.ox)
       .filter((v): v is number => v != null && Number.isFinite(v));
     const heatmapZFlat = heatmapData ? heatmapData.z.flat().filter((v): v is number => Number.isFinite(v)) : [];
     const allValues = [...oxValues, ...heatmapZFlat];
-    const dataMin = allValues.length ? Math.min(...allValues) : 0;
-    const dataMax = allValues.length ? Math.max(...allValues) : 250;
+    const rawMin = allValues.length ? Math.min(...allValues) : 0;
+    const rawMax = allValues.length ? Math.max(...allValues) : 250;
+    const dataMin = Math.max(0, rawMin);
+    const dataMax = Math.min(MAP_OX_SCALE_MAX, rawMax);
     const range = dataMax - dataMin || 1;
     const zMin = Math.max(0, dataMin - range * 0.1);
-    const zMax = Math.min(250, dataMax + range * 0.1);
+    const zMax = Math.min(MAP_OX_SCALE_MAX, dataMax + range * 0.1);
+
+    if (rawMin < 0 || rawMax > MAP_OX_SCALE_MAX) {
+      const outliers = latestWithNames.filter(
+        (r) => r.ox != null && Number.isFinite(r.ox) && (r.ox < 0 || r.ox > MAP_OX_SCALE_MAX)
+      );
+      if (outliers.length > 0) {
+        console.warn(
+          '[drawMapPlotly] 等高線スケール外のOX値（異常値の可能性）:',
+          outliers.map((r) => ({ station_id: r.station_id, name: r.name, ox: r.ox }))
+        );
+      }
+    }
 
     for (const ring of outlineRings) {
       if (ring.length === 0) continue;
@@ -401,7 +419,7 @@
         colorbar: { title: 'OX (ppb)' },
       });
       const contourStart = Math.floor(zMin / 10) * 10;
-      const contourEnd = Math.min(250, Math.ceil(zMax / 10) * 10);
+      const contourEnd = Math.min(MAP_OX_SCALE_MAX, Math.ceil(zMax / 10) * 10);
       traces.push({
         x: heatmapX,
         y: heatmapY,
@@ -454,6 +472,7 @@
         showlegend: false,
       });
     }
+    const plotHeight = Math.max(200, mapPlotDiv.parentElement?.clientHeight ?? 420);
     const layout = {
       xaxis: {
         title: '経度',
@@ -467,7 +486,7 @@
         scaleratio: 1,
       },
       margin: { t: 24, r: 24, b: 40, l: 52 },
-      height: 420,
+      height: plotHeight,
       showlegend: false,
     };
     Plotly.react(mapPlotDiv, traces, layout, { responsive: true, displayModeBar: true });
@@ -485,9 +504,27 @@
     void outlineRings.length;
     drawMapPlotly();
   }
+
+  let panelRoot: HTMLElement;
+  let resizeObserver: ResizeObserver | null = null;
+
+  onMount(() => {
+    tick().then(() => {
+      const observeTarget = mapPlotDiv?.parentElement ?? panelRoot;
+      if (!observeTarget || !mapPlotDiv) return;
+      resizeObserver = new ResizeObserver(() => {
+        if (mapPlotDiv) drawMapPlotly();
+      });
+      resizeObserver.observe(observeTarget);
+    });
+  });
+
+  onDestroy(() => {
+    resizeObserver?.disconnect();
+  });
 </script>
 
-<section class="section map-section">
+<section class="section map-section" bind:this={panelRoot}>
   <h2>{prefName} OX 分布（補間・ヒートマップ）</h2>
   {#if datetime}
     <p class="map-datetime">対象時刻: {datetime}</p>
@@ -514,10 +551,13 @@
 
 <style>
   .section {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     background: #fff;
     border-radius: 12px;
     padding: 1.25rem 1.5rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 0;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
   }
   .section h2 {
@@ -538,8 +578,8 @@
   }
   .plotly-map-wrap {
     position: relative;
-    height: 420px;
-    min-height: 420px;
+    flex: 1 1 0;
+    min-height: 200px;
   }
   .plotly-map-wrap .map-gradient-img {
     position: absolute;
@@ -554,14 +594,16 @@
   .plotly-map-wrap .plotly-map {
     position: relative;
     z-index: 1;
-    min-height: 420px;
+    min-height: 200px;
+    height: 100%;
   }
   .plotly-map-wrap .plotly-debug3 {
     margin-top: 1rem;
-    min-height: 420px;
+    min-height: 200px;
   }
   .plotly-container {
-    min-height: 420px;
+    min-height: 200px;
+    height: 100%;
     width: 100%;
     min-width: 0;
     max-width: 100%;

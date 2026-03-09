@@ -57,10 +57,13 @@
 
 <style>
   .section {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     background: #fff;
     border-radius: 12px;
     padding: 1.25rem 1.5rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 0;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
   }
   .section h2 {
@@ -68,21 +71,25 @@
     font-size: 1.1rem;
     font-weight: 600;
     color: #333;
+    flex-shrink: 0;
   }
   .simulate-note {
     margin: 0 0 0.25rem 0;
     font-size: 0.85rem;
     color: #e65100;
     font-weight: 600;
+    flex-shrink: 0;
   }
   .target-datetime {
     margin: 0 0 0.75rem 0;
     font-size: 0.9rem;
     color: #555;
+    flex-shrink: 0;
   }
   .table-wrap {
+    flex: 1 1 0;
+    min-height: 0;
     overflow: auto;
-    max-height: 320px;
   }
   .data-table {
     width: 100%;
@@ -128,6 +135,7 @@
     white-space: nowrap;
   }
   .table-legend {
+    flex-shrink: 0;
     margin-top: 1rem;
     padding-top: 0.75rem;
     border-top: 1px solid #eee;

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount, onDestroy, tick } from 'svelte';
   import Plotly from 'plotly.js-dist-min';
   import type { OxSeriesItem } from './types';
 
@@ -8,6 +9,8 @@
   const OX_REFERENCE_PPB = 120;
 
   let plotDiv: HTMLDivElement | null = null;
+  let panelRoot: HTMLElement;
+  let resizeObserver: ResizeObserver | null = null;
 
   function drawPlotly() {
     if (!plotDiv || oxSeriesByStation.length === 0) return;
@@ -20,6 +23,7 @@
       line: { width: 1.5 },
       connectgaps: false,
     }));
+    const plotHeight = Math.max(200, plotDiv.offsetHeight || plotDiv.clientHeight || 420);
     const layout = {
       margin: { t: 24, r: 24, b: 40, l: 52 },
       xaxis: {
@@ -57,7 +61,7 @@
       ],
       showlegend: true,
       legend: { x: 1, y: 1, xanchor: 'left' },
-      height: 420,
+      height: plotHeight,
     };
     Plotly.react(plotDiv, traces, layout, { responsive: true, displayModeBar: true });
     requestAnimationFrame(() => {
@@ -68,9 +72,24 @@
   $: if (plotDiv && oxSeriesByStation.length > 0) {
     drawPlotly();
   }
+
+  onMount(() => {
+    tick().then(() => {
+      const observeTarget = plotDiv?.parentElement ?? panelRoot;
+      if (!observeTarget || !plotDiv) return;
+      resizeObserver = new ResizeObserver(() => {
+        if (plotDiv) drawPlotly();
+      });
+      resizeObserver.observe(observeTarget);
+    });
+  });
+
+  onDestroy(() => {
+    resizeObserver?.disconnect();
+  });
 </script>
 
-<section class="section timeseries">
+<section class="section timeseries" bind:this={panelRoot}>
   <h2>過去24時間の OX 推移（1時間値）</h2>
   {#if oxSeriesByStation.length > 0}
     <div class="plotly-container" bind:this={plotDiv}></div>
@@ -81,10 +100,13 @@
 
 <style>
   .section {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
     background: #fff;
     border-radius: 12px;
     padding: 1.25rem 1.5rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 0;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
     overflow: hidden;
     max-width: 100%;
@@ -94,9 +116,11 @@
     font-size: 1.1rem;
     font-weight: 600;
     color: #333;
+    flex-shrink: 0;
   }
   .plotly-container {
-    min-height: 420px;
+    flex: 1 1 0;
+    min-height: 200px;
     width: 100%;
     min-width: 0;
     max-width: 100%;
