@@ -126,6 +126,24 @@ def _fetch_station_snapshot(target_dt_iso: str, pollutant_col: str) -> pd.DataFr
     return df
 
 
+def _fetch_station_count(target_dt_iso: str, pollutant_col: str) -> int:
+    """指定時刻・物質の有効測定局数を返す（キャッシュ無効化判定用）。"""
+    query = f"""
+        SELECT COUNT(*) FROM measurements m
+        INNER JOIN (
+            SELECT station_code, MAX(target_datetime) AS max_dt
+            FROM measurements
+            WHERE target_datetime <= ?
+            GROUP BY station_code
+        ) latest
+            ON  m.station_code    = latest.station_code
+            AND m.target_datetime = latest.max_dt
+        WHERE m.{pollutant_col} IS NOT NULL
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(query, (target_dt_iso,)).fetchone()[0]
+
+
 def _get_or_compute_grid(
     datetime_hour: str,
     z: int,
@@ -135,12 +153,20 @@ def _get_or_compute_grid(
 ) -> GridCacheEntry:
     """
     キャッシュから取得。なければ補間計算してキャッシュに保存し返す.
+    collect で新データが入った場合は測定局数が変わるため、キャッシュを無効化して再計算する。
     """
+    pollutant_col = POLLUTANT_PARAM_TO_COL.get(pollutant)
     cached = get_cache(datetime_hour, z, method, pollutant, smoothing)
+    if cached is not None and pollutant_col is not None:
+        # データ更新検知: 現在の DB の測定局数がキャッシュ作成時と異なれば無効化
+        cached_count = cached.get("apw_station_count")
+        if cached_count is not None:
+            current_count = _fetch_station_count(datetime_hour, pollutant_col)
+            if current_count != cached_count:
+                cached = None
     if cached is not None:
         return cached
 
-    pollutant_col = POLLUTANT_PARAM_TO_COL.get(pollutant)
     if pollutant_col is None:
         raise HTTPException(status_code=400, detail=f"不明な汚染物質: {pollutant}")
 
@@ -219,6 +245,7 @@ def _get_or_compute_grid(
         field.astype(np.float32),
         apw_snapshot_at, apw_oldest_station_at, generated_at,
         smoothing=smoothing,
+        apw_station_count=len(merged),
     )
 
     return GridCacheEntry(
@@ -230,6 +257,7 @@ def _get_or_compute_grid(
         apw_snapshot_at=apw_snapshot_at,
         apw_oldest_station_at=apw_oldest_station_at,
         generated_at=generated_at,
+        apw_station_count=len(merged),
     )
 
 
