@@ -132,13 +132,6 @@ export async function fetchMeasurementsSeries(
   });
 }
 
-/** 神奈川県輪郭 GeoJSON（API 経由で CORS 回避） */
-export async function fetchKanagawaGeoJSON(): Promise<{
-  type: string;
-  features: Array<{ type: string; properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } }>;
-}> {
-  return get<{ type: string; features: Array<{ type: string; properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } }> }>('/v1/geojson/kanagawa');
-}
 
 /** 指定都道府県の輪郭（簡略化済み rings）と輪郭から算出した bbox。県単位で取得するため軽量。 */
 export interface PrefectureOutlineResponse {
