@@ -5,7 +5,6 @@ import datetime
 import json
 import re
 import sqlite3
-import urllib.request
 from pathlib import Path
 from typing import List, Union, Literal, Dict, Any
 
@@ -203,8 +202,6 @@ def _series_to_station_detail(s: pd.Series) -> StationDetail:
 
 
 REGION_ORDER = ("北海道", "東北", "関東", "中部", "近畿", "中国", "四国", "九州", "沖縄")
-
-JAPAN_GEOJSON_URL = "https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson"
 
 
 # --- エンドポイント ---
