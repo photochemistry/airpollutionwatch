@@ -260,8 +260,10 @@
       const normalized = parsed.map((item: LayoutItem & { width?: number; height?: number }) => {
         const w = Number(item.w ?? item.width ?? 6);
         const h = Number(item.h ?? item.height ?? 3);
+        let id = item.id;
+        if (id === 'panel-weather') id = 'panel-appendix';
         return {
-          id: item.id,
+          id,
           x: Number(item.x ?? 0),
           y: Number(item.y ?? 0),
           w: Math.max(MIN_ITEM_W, w),

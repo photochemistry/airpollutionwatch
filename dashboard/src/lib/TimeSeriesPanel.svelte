@@ -1,6 +1,16 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
-  import Plotly from 'plotly.js-dist-min';
+  import {
+    Chart,
+    LineController,
+    LineElement,
+    PointElement,
+    LinearScale,
+    TimeScale,
+    Tooltip,
+    Legend,
+  } from 'chart.js';
+  import 'chartjs-adapter-date-fns';
   import type { OxSeriesItem } from './types';
 
   export let oxSeriesByStation: OxSeriesItem[] = [];
@@ -8,77 +18,124 @@
 
   const OX_REFERENCE_PPB = 120;
 
-  let plotDiv: HTMLDivElement | null = null;
+  Chart.register(
+    LineController,
+    LineElement,
+    PointElement,
+    LinearScale,
+    TimeScale,
+    Tooltip,
+    Legend,
+  );
+
+  let canvasEl: HTMLCanvasElement | null = null;
+  let chart: Chart<'line'> | null = null;
   let panelRoot: HTMLElement;
   let resizeObserver: ResizeObserver | null = null;
 
-  function drawPlotly() {
-    if (!plotDiv || oxSeriesByStation.length === 0) return;
-    const traces = oxSeriesByStation.map((series) => ({
-      x: series.values.map((p) => p.datetime),
-      y: series.values.map((p) => (p.value != null ? p.value * oxDisplayMultiplier : null)),
-      name: series.name,
-      type: 'scatter' as const,
-      mode: 'lines' as const,
-      line: { width: 1.5 },
-      connectgaps: false,
-    }));
-    const plotHeight = Math.max(200, plotDiv.offsetHeight || plotDiv.clientHeight || 420);
-    const layout = {
-      margin: { t: 24, r: 24, b: 40, l: 52 },
-      xaxis: {
-        type: 'date',
-        title: { text: '時刻（過去24時間）' },
-        rangeslider: { visible: false },
-      },
-      yaxis: {
-        title: { text: 'OX (ppb)' },
-        rangemode: 'tozero' as const,
-      },
-      shapes: [
-        {
-          type: 'line' as const,
-          xref: 'paper',
-          yref: 'y',
-          x0: 0,
-          x1: 1,
-          y0: OX_REFERENCE_PPB,
-          y1: OX_REFERENCE_PPB,
-          line: { color: '#e65100', width: 1.5, dash: 'dash' },
-        },
-      ],
-      annotations: [
-        {
-          xref: 'paper',
-          yref: 'y',
-          x: 1,
-          y: OX_REFERENCE_PPB,
-          xanchor: 'left',
-          text: ` ${OX_REFERENCE_PPB} ppb`,
-          showarrow: false,
-          font: { size: 11, color: '#e65100' },
-        },
-      ],
-      showlegend: true,
-      legend: { x: 1, y: 1, xanchor: 'left' },
-      height: plotHeight,
-    };
-    Plotly.react(plotDiv, traces, layout, { responsive: true, displayModeBar: true });
-    requestAnimationFrame(() => {
-      if (plotDiv && typeof Plotly.Plots?.resize === 'function') Plotly.Plots.resize(plotDiv);
+  function buildChartConfig() {
+    const datasets = oxSeriesByStation.map((series, index) => {
+      const colorPalette = [
+        '#1f77b4',
+        '#ff7f0e',
+        '#2ca02c',
+        '#d62728',
+        '#9467bd',
+        '#8c564b',
+        '#e377c2',
+        '#7f7f7f',
+        '#bcbd22',
+        '#17becf',
+      ];
+      const color = colorPalette[index % colorPalette.length];
+      return {
+        label: series.name,
+        data: series.values.map((p) => ({
+          x: p.datetime,
+          y: p.value != null ? p.value * oxDisplayMultiplier : null,
+        })),
+        borderColor: color,
+        backgroundColor: color,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        spanGaps: false,
+      };
     });
+
+    const options: import('chart.js').ChartOptions<'line'> = {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          type: 'time',
+          time: {
+            unit: 'hour',
+          },
+          title: {
+            display: true,
+            text: '時刻（過去24時間）',
+          },
+        },
+        y: {
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: 'OX (ppb)',
+          },
+        },
+      },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+        },
+        tooltip: {
+          mode: 'nearest',
+          intersect: false,
+        },
+        annotation: undefined,
+      },
+      elements: {
+        line: {
+          tension: 0,
+        },
+      },
+    };
+
+    return {
+      type: 'line' as const,
+      data: { datasets },
+      options,
+    };
   }
 
-  $: if (plotDiv && oxSeriesByStation.length > 0) {
-    drawPlotly();
+  function drawChart() {
+    if (!canvasEl || oxSeriesByStation.length === 0) return;
+    const ctx = canvasEl.getContext('2d');
+    if (!ctx) return;
+
+    const config = buildChartConfig();
+
+    if (chart) {
+      chart.data = config.data;
+      chart.options = config.options;
+      chart.update();
+    } else {
+      chart = new Chart(ctx, config);
+    }
+  }
+
+  $: if (canvasEl && oxSeriesByStation.length > 0) {
+    drawChart();
   }
 
   onMount(() => {
     tick().then(() => {
-      const observeTarget = plotDiv?.parentElement ?? panelRoot;
-      if (!observeTarget || !plotDiv) return;
+      const observeTarget = canvasEl?.parentElement ?? panelRoot;
+      if (!observeTarget || !canvasEl) return;
       resizeObserver = new ResizeObserver(() => {
-        if (plotDiv) drawPlotly();
+        if (!canvasEl) return;
+        drawChart();
       });
       resizeObserver.observe(observeTarget);
     });
@@ -86,13 +143,17 @@
 
   onDestroy(() => {
     resizeObserver?.disconnect();
+    chart?.destroy();
+    chart = null;
   });
 </script>
 
 <section class="section timeseries" bind:this={panelRoot}>
   <h2>過去24時間の OX 推移（1時間値）</h2>
   {#if oxSeriesByStation.length > 0}
-    <div class="plotly-container" bind:this={plotDiv}></div>
+    <div class="chartjs-container">
+      <canvas bind:this={canvasEl}></canvas>
+    </div>
   {:else}
     <p class="muted">時系列データがありません（過去24時間のデータまたはAPI未取得）</p>
   {/if}
@@ -118,7 +179,7 @@
     color: #333;
     flex-shrink: 0;
   }
-  .plotly-container {
+  .chartjs-container {
     flex: 1 1 0;
     min-height: 200px;
     width: 100%;
@@ -126,10 +187,12 @@
     max-width: 100%;
     overflow: hidden;
     box-sizing: border-box;
+    position: relative;
   }
-  .plotly-container :global(.plotly),
-  .plotly-container :global(.svg-container) {
-    max-width: 100% !important;
+  .chartjs-container canvas {
+    width: 100% !important;
+    height: 100% !important;
+    display: block;
   }
   .muted {
     font-size: 0.85rem;

@@ -3,6 +3,7 @@
   import Plotly from 'plotly.js-dist-min';
   import type { GridFieldResponse } from './api';
   import type { LatestRow, BBox } from './types';
+  import { fetchWindForBbox, type WindPoint } from './openmeteo';
 
   export let gridFieldData: GridFieldResponse | null = null;
   export let latestWithNames: LatestRow[] = [];
@@ -21,8 +22,19 @@
   let mapPlotDiv: HTMLDivElement | null = null;
   let debugPlot3Div: HTMLDivElement | null = null;
   let mapGradientDataUrl: string | null = null;
+  /** Open-Meteo 風向風速（矢印表示用）。マーカー下・地図上で描画 */
+  let windData: WindPoint[] | null = null;
+  /** 現在の windData がどの bbox|datetime 用か。一致するときだけ矢印を描画（他県の矢印が一瞬出ないように） */
+  let windDataKey: string | null = null;
+  let windKeyMismatchLogged = false;
 
   const REF_PPB = 120;
+  /** 風矢印の長さ = 1時間に空気が移動する距離（km）を地図上に表現。風速は km/h なので 矢印長(km)=speed_kmh。1°≒111km として scale=1/111 */
+  const KM_PER_DEG_LAT = 111;
+  const WIND_ARROW_SCALE_DEG_PER_KMH = 1 / KM_PER_DEG_LAT;
+  /** 鏃の長さ・幅（矢本体の長さに対する比） */
+  const WIND_ARROW_HEAD_RATIO = 0.3;
+  const WIND_ARROW_HEAD_HALFWIDTH = 0.2;
 
   function tileXYToLonLat(x: number, y: number, zoom: number): [number, number] {
     const n = 2 ** zoom;
@@ -272,6 +284,37 @@
     return { x, y, z };
   }
 
+  /** 風向は「吹いてくる方向」なので、矢印は「吹いていく方向」= (direction+180)° で描く。先端に鏃を付ける */
+  function windPointsToArrowSegments(points: WindPoint[]): { x: (number | null)[]; y: (number | null)[] } {
+    const x: (number | null)[] = [];
+    const y: (number | null)[] = [];
+    for (const p of points) {
+      const blowDeg = (p.direction_deg + 180) % 360;
+      const rad = (blowDeg * Math.PI) / 180;
+      const len = p.speed_kmh * WIND_ARROW_SCALE_DEG_PER_KMH;
+      const dx = len * Math.sin(rad);
+      const dy = len * Math.cos(rad);
+      const tipX = p.lon + dx;
+      const tipY = p.lat + dy;
+      // 矢本体: 根元 → 先端
+      x.push(p.lon, tipX, null);
+      y.push(p.lat, tipY, null);
+      // 鏃: 先端から左右に短い線（逆向き＋垂直成分）
+      const backX = dx * WIND_ARROW_HEAD_RATIO;
+      const backY = dy * WIND_ARROW_HEAD_RATIO;
+      const wing = len * WIND_ARROW_HEAD_HALFWIDTH;
+      const leftX = tipX - backX - wing * Math.cos(rad);
+      const leftY = tipY - backY + wing * Math.sin(rad);
+      const rightX = tipX - backX + wing * Math.cos(rad);
+      const rightY = tipY - backY - wing * Math.sin(rad);
+      x.push(tipX, leftX, null);
+      y.push(tipY, leftY, null);
+      x.push(tipX, rightX, null);
+      y.push(tipY, rightY, null);
+    }
+    return { x, y };
+  }
+
   function makeKanagawaSinCosData(): { x: number[]; y: number[]; z: number[][] } {
     const nx = 40;
     const ny = 30;
@@ -448,6 +491,32 @@
         console.log('[drawMapPlotly] no heatmapData (gridFieldData が null＝API 未取得または取得失敗)');
       }
     }
+    /* 風向風速: 現在の地図用のデータのときだけ描画（他県の矢印が一瞬表示されない）。白・先端に鏃 */
+    if (windData && windData.length > 0 && windDataKey === windKey) {
+      const { minLon, minLat, maxLon, maxLat } = bboxForMap;
+      const tol = 0.02;
+      const inBbox = windData.filter(
+        (p) =>
+          p.lon >= minLon - tol &&
+          p.lon <= maxLon + tol &&
+          p.lat >= minLat - tol &&
+          p.lat <= maxLat + tol
+      );
+      if (inBbox.length > 0) {
+        const { x: windX, y: windY } = windPointsToArrowSegments(inBbox);
+        traces.push({
+          x: windX,
+          y: windY,
+          type: 'scatter',
+          mode: 'lines',
+          line: { color: '#fff', width: 2 },
+          showlegend: false,
+        });
+      }
+    } else if (windData && windData.length > 0 && windDataKey != null && windDataKey !== windKey && !windKeyMismatchLogged) {
+      console.warn('[風矢印] キー不一致のため矢印を描画していません（県切り替え直後など）。windDataKey=', windDataKey.slice(0, 50), 'windKey=', windKey.slice(0, 50));
+      windKeyMismatchLogged = true;
+    }
     const stationLons: number[] = [];
     const stationLats: number[] = [];
     const stationColors: string[] = [];
@@ -498,10 +567,38 @@
     }, 300);
   }
 
+  /** 現在の地図範囲・時刻。正規化してキーを安定させる（outline/stations の bbox 差・datetime 表記ゆれで不一致にならないように） */
+  $: bboxStr = bboxForMap
+    ? [bboxForMap.minLon, bboxForMap.minLat, bboxForMap.maxLon, bboxForMap.maxLat]
+        .map((n) => Number(n).toFixed(2))
+        .join(',')
+    : '';
+  $: datetimeNorm = datetime ? String(datetime).slice(0, 13) : '';
+  $: windKey = `${bboxStr}|${datetimeNorm}`;
+  $: if (bboxStr && datetimeNorm) {
+    const keyWhenStarted = windKey;
+    fetchWindForBbox(bboxForMap!, datetime).then((d) => {
+      if (windKey === keyWhenStarted) {
+        windData = d ?? null;
+        windDataKey = keyWhenStarted;
+        if (d && d.length > 0) {
+          console.log('[風矢印] 風データ取得 OK, 点数=', d.length);
+        }
+      } else {
+        if (d && d.length > 0) {
+          console.log('[風矢印] 風データ取得したが表示中の県と不一致のため破棄');
+        }
+      }
+    });
+  }
+
   $: if (mapPlotDiv && dataVersion >= 0) {
     void gridFieldData;
     void latestWithNames.length;
     void outlineRings.length;
+    void windData;
+    void windKey;
+    void windDataKey;
     drawMapPlotly();
   }
 
@@ -546,7 +643,7 @@
       <div class="plotly-container plotly-map" bind:this={mapPlotDiv}></div>
     {/if}
   </div>
-  <p class="map-legend">階調: 低（緑）→ 高（赤）。ヒートマップは半透過、等高線は10ppb間隔。太線は県輪郭（dataofjapan/land）。〇は測定局。</p>
+  <p class="map-legend">階調: 低（緑）→ 高（赤）。ヒートマップは半透過、等高線は10ppb間隔。太線は県輪郭（dataofjapan/land）。矢印は風向・風速（Open-Meteo）。矢印の長さ＝1時間の移動距離（例: 1m/s→3.6km）。〇は測定局。</p>
 </section>
 
 <style>

@@ -25,16 +25,29 @@ export interface WindPoint {
   direction_deg: number;
 }
 
-/** bbox 内で等間隔のグリッド点を生成（経緯度 step、最大点数で制限） */
-function buildGridPoints(bbox: BBox, stepDeg = 0.25, maxPerAxis = 12): { lats: number[]; lons: number[] } {
+/** 1リクエストあたりの最大地点数（Open-Meteo の制限を考慮） */
+const MAX_WIND_POINTS = 100;
+
+/** bbox 内で等間隔のグリッド点を生成。約12〜15km間隔、最大 MAX_WIND_POINTS 点 */
+function buildGridPoints(bbox: BBox): { lats: number[]; lons: number[] } {
+  const stepDeg = 0.12;
+  const latSpan = bbox.maxLat - bbox.minLat;
+  const lonSpan = bbox.maxLon - bbox.minLon;
+  let nLat = Math.max(1, Math.ceil(latSpan / stepDeg) + 1);
+  let nLon = Math.max(1, Math.ceil(lonSpan / stepDeg) + 1);
+  if (nLat * nLon > MAX_WIND_POINTS) {
+    const r = Math.sqrt(MAX_WIND_POINTS / (nLat * nLon));
+    nLat = Math.max(1, Math.floor(nLat * r));
+    nLon = Math.max(1, Math.floor(nLon * r));
+  }
+  const latStep = nLat > 1 ? latSpan / (nLat - 1) : 0;
+  const lonStep = nLon > 1 ? lonSpan / (nLon - 1) : 0;
   const lats: number[] = [];
   const lons: number[] = [];
-  const latStep = Math.max(stepDeg, (bbox.maxLat - bbox.minLat) / maxPerAxis);
-  const lonStep = Math.max(stepDeg, (bbox.maxLon - bbox.minLon) / maxPerAxis);
-  for (let lat = bbox.minLat; lat <= bbox.maxLat + 1e-6; lat += latStep) {
-    for (let lon = bbox.minLon; lon <= bbox.maxLon + 1e-6; lon += lonStep) {
-      lats.push(lat);
-      lons.push(lon);
+  for (let i = 0; i < nLat; i++) {
+    for (let j = 0; j < nLon; j++) {
+      lats.push(bbox.minLat + i * latStep);
+      lons.push(bbox.minLon + j * lonStep);
     }
   }
   return { lats, lons };
@@ -79,7 +92,14 @@ export async function fetchWindForBbox(
   const url = `${OPENMETEO_BASE}?${params.toString()}`;
   try {
     const res = await fetch(url);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 429) {
+        console.warn('[Open-Meteo] 429 Too Many Requests: Open-Meteo のアクセス制限（レート制限）に引っかかっている可能性があります。');
+      } else {
+        console.warn('[Open-Meteo] 風データ取得失敗:', res.status, res.statusText);
+      }
+      return null;
+    }
     const data = await res.json() as OpenMeteoLocationResponse[];
     const list = Array.isArray(data) ? data : [data];
     const points: WindPoint[] = [];
@@ -88,16 +108,23 @@ export async function fetchWindForBbox(
       const speed = loc.hourly.wind_speed_10m?.[idx];
       const dir = loc.hourly.wind_direction_10m?.[idx];
       if (speed != null && Number.isFinite(speed) && dir != null && Number.isFinite(dir)) {
-        points.push({
-          lat: loc.latitude,
-          lon: loc.longitude,
-          speed_kmh: speed,
-          direction_deg: dir,
-        });
+        const lat = loc.latitude;
+        const lon = loc.longitude;
+        const tol = 0.02;
+        if (
+          lon >= bbox.minLon - tol && lon <= bbox.maxLon + tol &&
+          lat >= bbox.minLat - tol && lat <= bbox.maxLat + tol
+        ) {
+          points.push({ lat, lon, speed_kmh: speed, direction_deg: dir });
+        }
       }
     }
+    if (points.length === 0) {
+      console.warn('[Open-Meteo] 風データ: bbox 内に有効な点がありませんでした。');
+    }
     return points;
-  } catch {
+  } catch (e) {
+    console.warn('[Open-Meteo] 風データ取得エラー:', e);
     return null;
   }
 }
