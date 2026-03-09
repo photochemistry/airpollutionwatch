@@ -2,8 +2,10 @@
 API v1: 都道府県・測定局・測定データ・収集ログなどのエンドポイント。
 """
 import datetime
+import json
 import re
 import sqlite3
+import urllib.request
 from pathlib import Path
 from typing import List, Union, Literal, Dict, Any
 
@@ -50,6 +52,7 @@ PREF_ID_TO_REGION: Dict[str, str] = {
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "airpollutionwatch.sqlite3"
+GEOJSON_OUTLINES_DIR = ROOT / "geojson_outlines"
 COLLECT_LOG_PATH = ROOT / "collect.log"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
 PREF_LINKS_PATH = ROOT / ".." / "airpollutionwatch" / "pref-links.md"
@@ -201,8 +204,33 @@ def _series_to_station_detail(s: pd.Series) -> StationDetail:
 
 REGION_ORDER = ("北海道", "東北", "関東", "中部", "近畿", "中国", "四国", "九州", "沖縄")
 
+JAPAN_GEOJSON_URL = "https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson"
+
 
 # --- エンドポイント ---
+
+
+@router.get("/geojson/outline/{pref_id}")
+async def geojson_outline(pref_id: str):
+    """指定都道府県の輪郭（簡略化済み）を rings 形式で返す。県単位表示・軽量化用。
+    scripts/generate_prefecture_outlines.py で geojson_outlines/{pref_id}.json を生成しておくこと。"""
+    if pref_id not in PREF_ID_TO_NAME:
+        raise HTTPException(status_code=404, detail=f"未知の都道府県 ID: {pref_id}")
+    path = GEOJSON_OUTLINES_DIR / f"{pref_id}.json"
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"輪郭データがありません。scripts/generate_prefecture_outlines.py を実行してください: {pref_id}",
+        )
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"輪郭の読み込みに失敗しました: {e!s}")
+    if "rings" not in data:
+        raise HTTPException(status_code=500, detail="輪郭 JSON に rings が含まれていません")
+    return data
+
 
 @router.get("/prefectures", response_model=List[PrefectureInfo])
 async def prefectures():
