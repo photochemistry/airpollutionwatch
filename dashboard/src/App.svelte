@@ -19,7 +19,7 @@
   import { getOxLevel } from './lib/constants';
   import { normalizeStationId } from './lib/utils';
   import type { LatestRow, OxSeriesItem, BBox } from './lib/types';
-  import MapPanel from './lib/MapPanel.svelte';
+  import MapPanelLeaflet from './lib/MapPanelLeaflet.svelte';
   import TimeSeriesPanel from './lib/TimeSeriesPanel.svelte';
   import LatestTable from './lib/LatestTable.svelte';
   import AppendixPanel from './lib/AppendixPanel.svelte';
@@ -391,7 +391,7 @@
       gs-min-h="3"
     >
       <div class="grid-stack-item-content">
-        <MapPanel
+        <MapPanelLeaflet
           {gridFieldData}
           {latestWithNames}
           {outlineRings}

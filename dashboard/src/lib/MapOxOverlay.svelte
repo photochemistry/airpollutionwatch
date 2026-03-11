@@ -69,6 +69,10 @@
       return v * mul;
     };
 
+    /** 彩色は絶対スケール（0～REF_PPB ppb）で行う */
+    const HEATMAP_OX_ABS_MIN = 0;
+    const HEATMAP_OX_ABS_MAX = REF_PPB;
+
     let vMin = Infinity;
     let vMax = -Infinity;
     for (let row = 0; row < ny; row++) {
@@ -98,7 +102,7 @@
     for (let row = 0; row < ny; row++) {
       for (let col = 0; col < nx; col++) {
         const val = getVal(row, col);
-        ctx.fillStyle = valueToRgbaRelative(val, vMin, vMax);
+        ctx.fillStyle = valueToRgbaRelative(val, HEATMAP_OX_ABS_MIN, HEATMAP_OX_ABS_MAX);
         ctx.fillRect(col, row, 1, 1);
       }
     }

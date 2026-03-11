@@ -392,7 +392,12 @@
     mapGradientDataUrl = null;
     const traces: Record<string, unknown>[] = [];
 
-    /** 等高線・ヒートマップのスケールはこの範囲にクランプ（1局の異常値で全国が崩れないように） */
+    /** ヒートマップ・等高線は絶対スケール（0～REF_PPB ppb）で彩色。同じ濃度は常に同じ色になる。 */
+    const HEATMAP_OX_ABS_MIN = 0;
+    const HEATMAP_OX_ABS_MAX = REF_PPB;
+    const zMin = HEATMAP_OX_ABS_MIN;
+    const zMax = HEATMAP_OX_ABS_MAX;
+
     const MAP_OX_SCALE_MAX = 500;
     const oxValues = latestWithNames
       .map((r) => r.ox)
@@ -401,11 +406,6 @@
     const allValues = [...oxValues, ...heatmapZFlat];
     const rawMin = allValues.length ? Math.min(...allValues) : 0;
     const rawMax = allValues.length ? Math.max(...allValues) : 250;
-    const dataMin = Math.max(0, rawMin);
-    const dataMax = Math.min(MAP_OX_SCALE_MAX, rawMax);
-    const range = dataMax - dataMin || 1;
-    const zMin = Math.max(0, dataMin - range * 0.1);
-    const zMax = Math.min(MAP_OX_SCALE_MAX, dataMax + range * 0.1);
 
     if (rawMin < 0 || rawMax > MAP_OX_SCALE_MAX) {
       const outliers = latestWithNames.filter(
@@ -462,7 +462,7 @@
         colorbar: { title: 'OX (ppb)' },
       });
       const contourStart = Math.floor(zMin / 10) * 10;
-      const contourEnd = Math.min(MAP_OX_SCALE_MAX, Math.ceil(zMax / 10) * 10);
+      const contourEnd = Math.ceil(zMax / 10) * 10;
       traces.push({
         x: heatmapX,
         y: heatmapY,
