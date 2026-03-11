@@ -21,6 +21,7 @@
   let map: L.Map | null = null;
   let heatOverlay: L.ImageOverlay | null = null;
   let outlineLayer: L.LayerGroup | null = null;
+  let windArrowLayer: L.LayerGroup | null = null;
   let stationLayer: L.LayerGroup | null = null;
   let resizeObserver: ResizeObserver | null = null;
 
@@ -147,6 +148,16 @@
   /** ヒートマップ彩色は絶対スケール（0～REF_PPB ppb）で行う */
   const HEATMAP_OX_ABS_MIN = 0;
   const HEATMAP_OX_ABS_MAX = REF_PPB;
+  /** 風矢印: 長さ = 1時間の移動量(km)。1°≒111km */
+  const KM_PER_DEG_LAT = 111;
+  const WIND_ARROW_SCALE_DEG_PER_KMH = 1 / KM_PER_DEG_LAT;
+  /** 鏃の大きさは矢の長さに依存せず固定（度） */
+  const WIND_ARROW_HEAD_BACK_DEG = 0.02;
+  const WIND_ARROW_HEAD_WING_DEG = 0.01;
+  /** 測定局の風速は API で 0.1 m/s 単位。風向は16方位（4=東・16=北） */
+  const MS_TO_KMH = 3.6;
+  const WS_UNIT_MS = 0.1;
+  const WD_16_DEG_PER_DIV = 360 / 16;
 
   function updateHeatOverlay(data: GridFieldResponse) {
     if (!map) return;
@@ -205,6 +216,59 @@
     }
   }
 
+  /** 測定局の風向・風速から矢印の線分（各要素は [[lat,lng],[lat,lng]]）を生成。WD=吹いてくる方向→吹いていく方向で描く */
+  function stationWindToArrowSegments(rows: LatestRow[]): [number, number][][] {
+    const points = rows.filter(
+      (r) =>
+        r.lat != null &&
+        r.lon != null &&
+        r.wd != null &&
+        r.ws != null &&
+        Number.isFinite(r.lat) &&
+        Number.isFinite(r.lon) &&
+        Number.isFinite(r.wd) &&
+        Number.isFinite(r.ws)
+    );
+    const segments: [number, number][][] = [];
+    for (const r of points) {
+      const lat = r.lat!;
+      const lon = r.lon!;
+      const wdDeg = (r.wd! % 16) * WD_16_DEG_PER_DIV;
+      const blowDeg = (wdDeg + 180) % 360;
+      const rad = (blowDeg * Math.PI) / 180;
+      const len = r.ws! * WS_UNIT_MS * MS_TO_KMH * WIND_ARROW_SCALE_DEG_PER_KMH;
+      const dLon = len * Math.sin(rad);
+      const dLat = len * Math.cos(rad);
+      const tipLon = lon + dLon;
+      const tipLat = lat + dLat;
+      segments.push([[lat, lon], [tipLat, tipLon]]);
+      const backLon = WIND_ARROW_HEAD_BACK_DEG * Math.sin(rad);
+      const backLat = WIND_ARROW_HEAD_BACK_DEG * Math.cos(rad);
+      const wing = WIND_ARROW_HEAD_WING_DEG;
+      const leftLat = tipLat - backLat + wing * Math.sin(rad);
+      const leftLon = tipLon - backLon - wing * Math.cos(rad);
+      const rightLat = tipLat - backLat - wing * Math.sin(rad);
+      const rightLon = tipLon - backLon + wing * Math.cos(rad);
+      segments.push([[tipLat, tipLon], [leftLat, leftLon]]);
+      segments.push([[tipLat, tipLon], [rightLat, rightLon]]);
+    }
+    return segments;
+  }
+
+  function updateWindArrowLayer() {
+    if (!map) return;
+    if (windArrowLayer) {
+      windArrowLayer.clearLayers();
+    } else {
+      windArrowLayer = L.layerGroup().addTo(map);
+    }
+    const segs = stationWindToArrowSegments(latestWithNames);
+    for (const seg of segs) {
+      if (seg.length < 2) continue;
+      L.polyline(seg, { color: '#fff', weight: 2 }).addTo(windArrowLayer!);
+    }
+  }
+
   function updateStationLayer() {
     if (!map) return;
     if (stationLayer) {
@@ -258,6 +322,7 @@
     void outlineRings.length;
     void latestWithNames.length;
     updateOutlineLayer();
+    updateWindArrowLayer();
     updateStationLayer();
   }
 
@@ -308,6 +373,7 @@
       viewportGridData = gridFieldData;
     }
     updateOutlineLayer();
+    updateWindArrowLayer();
     updateStationLayer();
 
     void loadGridForViewport();
@@ -336,6 +402,7 @@
     map = null;
     heatOverlay = null;
     outlineLayer = null;
+    windArrowLayer = null;
     stationLayer = null;
   });
 </script>
@@ -362,7 +429,7 @@
     <div class="map-leaflet" bind:this={mapContainer}></div>
   </div>
   <p class="map-legend">
-    階調: 低（緑）→ 高（赤）。太線は県輪郭（dataofjapan/land）。〇は測定局。
+    階調: 低（緑）→ 高（赤）。〇は測定局。風速・風向を測定している局では白い矢印（向き=風向、長さ=1時間の移動量）を表示。
     {#if gridFieldData && dataRangeMin !== dataRangeMax}
       — 表示範囲: <strong>{dataRangeMin.toFixed(0)} ～ {dataRangeMax.toFixed(0)} ppb</strong>
     {/if}
