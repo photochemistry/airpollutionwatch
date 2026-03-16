@@ -555,6 +555,18 @@ class CollectionStatusItem(BaseModel):
     pref_url: str | None = Field(None, description="当該県の公式データページ URL（pref-links.md 由来）")
 
 
+class LogOverviewResponse(BaseModel):
+    """collect.log の概要（県別ステータス + ログ全文）"""
+
+    status_items: List[CollectionStatusItem] = Field(
+        ..., description="県ごとの収集巡回状況（直近 target_datetime・経過時間・log_status 等）"
+    )
+    collect_log: str | None = Field(
+        None,
+        description="collect.log の全文（存在しない/読み取れない場合は null）",
+    )
+
+
 def _load_pref_links() -> Dict[str, str]:
     """pref-links.md をパースし、県 ID → URL の辞書を返す。1行目はヘッダ、2行目以降は「県ID URL ...」形式。"""
     path = PREF_LINKS_PATH.resolve()
@@ -647,9 +659,8 @@ def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | Non
     return oldest_jst.isoformat(), round(delta_days, 1)
 
 
-@router.get("/log/status", response_model=List[CollectionStatusItem])
-async def log_status():
-    """各県の収集巡回状況を一覧で返す。collect.log が存在する場合は県ごとの状態（ok/warning/error）と代表メッセージを付与する。pref-links.md が存在する場合は県の公式URLを付与する。"""
+def _get_collection_status_items() -> List[CollectionStatusItem]:
+    """各県の収集巡回状況を一覧で返す。collect.log が存在する場合は県ごとの状態（ok/warning/error）と代表メッセージを付与する。"""
     now = datetime.datetime.now(UTC)
     log_status_map = _collect_log_status_per_prefecture()
     pref_links = _load_pref_links()
@@ -696,113 +707,19 @@ async def log_status():
     return result
 
 
-@router.get("/collect.log", response_class=Response)
-async def collect_log():
-    """収集ジョブのログファイル collect.log の内容をプレーンテキストで返す。"""
-    if not COLLECT_LOG_PATH.exists():
-        raise HTTPException(status_code=404, detail="collect.log not found")
-    try:
-        content = COLLECT_LOG_PATH.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Cannot read collect.log: {e}")
-    return Response(content=content, media_type="text/plain; charset=utf-8")
+@router.get("/log", response_model=LogOverviewResponse)
+async def collect_log_overview():
+    """収集ジョブログの概要を JSON で返す。県別巡回状況（status_items）と collect.log 本文（collect_log）を含む。"""
+    status_items = _get_collection_status_items()
 
+    collect_text: str | None = None
+    if COLLECT_LOG_PATH.exists():
+        try:
+            collect_text = COLLECT_LOG_PATH.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            collect_text = None
 
-COLLECT_LOG_HTML = """<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <title>collect.log / 巡回状況</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 1rem; background: #1e1e1e; color: #d4d4d4; }
-    h2 { font-size: 1rem; margin: 1rem 0 0.5rem; color: #d4d4d4; }
-    #status-table { border-collapse: collapse; font-size: 0.85rem; margin-bottom: 1rem; }
-    #status-table th, #status-table td { border: 1px solid #444; padding: 0.25rem 0.5rem; text-align: left; }
-    #status-table th { background: #333; }
-    #status-table tr:nth-child(even) { background: #252525; }
-    #status-table .no-data { color: #888; }
-    #status-table .hours-ago { font-variant-numeric: tabular-nums; }
-    #status-table .log-warn { color: #dcdc00; font-weight: bold; }
-    #status-table .log-err { color: #f14c4c; font-weight: bold; }
-    #status-table .log-msg { max-width: 28rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #status-table a.pref-link { color: #6fb3d8; text-decoration: none; }
-    #status-table a.pref-link:hover { text-decoration: underline; }
-    #meta { margin-bottom: 0.5rem; font-size: 0.9rem; color: #858585; }
-    #log { white-space: pre-wrap; word-break: break-all; font-family: monospace; }
-    details#log-details pre { margin: 0.5rem 0 0; }
-  </style>
-</head>
-<body>
-  <h2>各県の巡回状況</h2>
-  <div id="status-meta">読み込み中…</div>
-  <p id="status-legend" style="font-size: 0.85rem; color: #858585; margin: 0 0 0.5rem 0;">「最新の取得（経過）」＝最新1件の target_datetime が今から何時間前か（全県一括収集のため同じになりやすい）。「連続（さかのぼり）」＝1時間刻みで欠けなしに何日前までデータがあるか（県ごとに異なる）。</p>
-  <table id="status-table" aria-label="県別収集状況">
-    <thead><tr><th>県</th><th>地域</th><th>直近の target_datetime</th><th>最新の取得（経過）</th><th>連続データの最古</th><th>連続（さかのぼり）</th><th>状態</th><th>message</th></tr></thead>
-    <tbody id="status-body"></tbody>
-  </table>
-  <details id="log-details" style="margin-top: 1rem;">
-    <summary style="cursor: pointer;">collect.log（クリックで展開・5分ごとに自動更新）</summary>
-    <div id="meta" style="margin: 0.5rem 0; font-size: 0.9rem; color: #858585;">collect.log — <span id="updated">読み込み中…</span></div>
-    <pre id="log"></pre>
-  </details>
-  <script>
-    const PRELOAD_MINUTES = 5;
-    function esc(s) {
-      if (s == null || s === '') return '';
-      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-    }
-    function loadStatus() {
-      fetch('/v1/log/status')
-        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
-        .then(items => {
-          const tbody = document.getElementById('status-body');
-          tbody.innerHTML = items.map(it => {
-            const latest = it.latest_datetime ? it.latest_datetime.replace('T', ' ').slice(0, 19) : '—';
-            const hours = it.hours_ago != null ? it.hours_ago + ' 時間前' : '—';
-            const oldest = it.oldest_continuous_datetime ? it.oldest_continuous_datetime.replace('T', ' ').slice(0, 19) : '—';
-            const days = it.continuous_days_ago != null ? it.continuous_days_ago + ' 日前まで' : '—';
-            let statusCell = '正常';
-            if (it.log_status === 'warning') statusCell = '<span class="log-warn">WARN</span>';
-            else if (it.log_status === 'error') statusCell = '<span class="log-err">ERROR</span>';
-            const msg = it.log_message != null ? esc(it.log_message) : '—';
-            const rowClass = it.has_data ? '' : ' class="no-data"';
-            const nameCell = it.pref_url
-              ? '<a href="' + esc(it.pref_url) + '" target="_blank" rel="noopener noreferrer" class="pref-link">' + esc(it.name_ja) + '</a>'
-              : esc(it.name_ja);
-            return '<tr' + rowClass + '><td>' + nameCell + '</td><td>' + it.region + '</td><td>' + latest + '</td><td class="hours-ago">' + hours + '</td><td>' + oldest + '</td><td class="hours-ago">' + days + '</td><td>' + statusCell + '</td><td class="log-msg" title="' + esc(it.log_message || '') + '">' + msg + '</td></tr>';
-          }).join('');
-          document.getElementById('status-meta').textContent = '最終取得: ' + new Date().toLocaleString('ja-JP');
-        })
-        .catch(e => {
-          document.getElementById('status-body').innerHTML = '<tr><td colspan="8">取得できませんでした: ' + esc(e.message) + '</td></tr>';
-          document.getElementById('status-meta').textContent = 'エラー';
-        });
-    }
-    function loadLog() {
-      fetch('/v1/collect.log')
-        .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
-        .then(t => {
-          document.getElementById('log').textContent = t;
-          document.getElementById('updated').textContent = new Date().toLocaleString('ja-JP');
-        })
-        .catch(e => {
-          document.getElementById('log').textContent = '取得できませんでした: ' + e.message;
-          document.getElementById('updated').textContent = 'エラー';
-        });
-    }
-    loadStatus();
-    loadLog();
-    setInterval(loadLog, PRELOAD_MINUTES * 60 * 1000);
-  </script>
-</body>
-</html>
-"""
-
-
-@router.get("/log", response_class=Response)
-async def collect_log_view():
-    """collect.log をブラウザで閲覧するための簡易 HTML ビュー。5 分ごとに自動再取得。"""
-    return Response(content=COLLECT_LOG_HTML, media_type="text/html; charset=utf-8")
+    return LogOverviewResponse(status_items=status_items, collect_log=collect_text)
 
 
 @router.get("/meta/ai-docs", response_class=Response)

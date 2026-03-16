@@ -28,6 +28,8 @@ APP_DESCRIPTION = """
 airpollutionwatch は、日本全国の都道府県が公開している大気汚染データを
 1時間ごとに収集し、共通スキーマで提供するための Web API です。
 
+- **リポジトリ**: https://github.com/vitroid/airpollutionwatch-api
+
 ## API バージョン
 
 - **v1** (`/v1/...`): 現行のエンドポイント（都道府県・測定局・測定データ・収集ログなど）
@@ -41,8 +43,7 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 - `GET /v1/stations/{station_id}` — 局詳細
 - `GET /v1/latest` — 指定局または県内の直近最新値
 - `GET /v1/coverage` — 県別の連続データ期間（HTML）
-- `GET /v1/collect.log` / `GET /v1/log` — 収集ジョブログ（テキスト／HTML）。`/v1/log` は各県の巡回状況一覧付き
-- `GET /v1/log/status` — 各県の収集巡回状況（直近 target_datetime・経過時間）を JSON で返す
+- `GET /v1/log` — 収集ジョブログの概要を **JSON** で返す（県別巡回状況 `status_items` と `collect_log` 本文）
 
 ## グリッドエンドポイント（v1/grid）
 
