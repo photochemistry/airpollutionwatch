@@ -135,29 +135,14 @@ curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00
 
 ---
 
-### `GET /v1/collect.log`
-
-- **説明**: 収集ジョブのログファイル（`collect.log`）の中身をプレーンテキストで返します。
-- **用途**:
-  - `collect_hourly.py` を cron 等で 5 分ごとに動かしている場合の成否確認。
-  - どの県でどのようなエラーが発生しているかを一次チェックしたいとき。
-
-`curl` での例:
-
-```bash
-curl "https://andersan.net:8089/v1/collect.log"
-```
-
----
-
 ### `GET /v1/log`
 
-- **説明**: `collect.log` をブラウザで閲覧するための簡易 HTML ビューを返します。
-  - クライアント側 JavaScript により、5 分ごとに自動で `/v1/collect.log` を再取得します。
+- **説明**: 収集ジョブログの概要を **JSON** で返します。
+  - フィールド:
+    - `status_items`: 県ごとの収集巡回状況（直近 target_datetime・経過時間・ok/warning/error 等の `CollectionStatusItem` 配列）
+    - `collect_log`: `collect.log` の全文（存在しない・読み取り失敗時は `null`）
 - **用途**:
-  - ターミナルを開かずに、ブラウザから常時ログをモニタしたい場合。
-
-ブラウザで `https://andersan.net:8089/v1/log` にアクセスしてください。
+  - 収集ジョブの成否確認や、どの県でエラーが出ているかの確認。ダッシュボードから県別ステータスとログ本文をまとめて取得する場合。
 
 ---
 
@@ -226,7 +211,7 @@ curl "https://andersan.net:8089/v1/collect.log"
 ## 注意事項
 
 - 各都道府県のウェブサイト仕様変更により、突然データ取得に失敗することがあります。  
-  `/v1/collect.log` や `/v1/coverage` を併用して状態を確認してください。
+  `/v1/log` や `/v1/coverage` を併用して状態を確認してください。
 - 00 時ちょうどのデータが存在しない県については、前日 24 時の値になる場合があります。
 
 現時点では、次の 3 県については API 対応が完了していません（今後対応予定です）。
