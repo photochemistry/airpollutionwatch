@@ -19,21 +19,22 @@ CACHE_TTL_HOURS = 72
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS grid_cache (
-    cache_key            TEXT PRIMARY KEY,
-    z                    INTEGER NOT NULL,
-    method               TEXT NOT NULL,
-    datetime_hour        TEXT NOT NULL,
-    pollutant            TEXT NOT NULL,
-    shape_ny             INTEGER NOT NULL,
-    shape_nx             INTEGER NOT NULL,
-    tile_x_min           INTEGER NOT NULL,
-    tile_x_max           INTEGER NOT NULL,
-    tile_y_min           INTEGER NOT NULL,
-    tile_y_max           INTEGER NOT NULL,
-    field                BLOB NOT NULL,
-    apw_snapshot_at      TEXT,
+    cache_key             TEXT PRIMARY KEY,
+    z                     INTEGER NOT NULL,
+    method                TEXT NOT NULL,
+    datetime_hour         TEXT NOT NULL,
+    pollutant             TEXT NOT NULL,
+    shape_ny              INTEGER NOT NULL,
+    shape_nx              INTEGER NOT NULL,
+    tile_x_min            INTEGER NOT NULL,
+    tile_x_max            INTEGER NOT NULL,
+    tile_y_min            INTEGER NOT NULL,
+    tile_y_max            INTEGER NOT NULL,
+    field                 BLOB NOT NULL,
+    apw_snapshot_at       TEXT,
     apw_oldest_station_at TEXT,
-    generated_at         TEXT NOT NULL
+    generated_at          TEXT NOT NULL,
+    apw_station_count     INTEGER
 )
 """
 
@@ -47,11 +48,22 @@ class GridCacheEntry(TypedDict):
     apw_snapshot_at: str | None
     apw_oldest_station_at: str | None
     generated_at: str
+    apw_station_count: int | None
 
 
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(CACHE_DB_PATH)
+    # テーブル作成（存在しない場合のみ）
     conn.execute(_DDL)
+    # 既存 DB に apw_station_count 列がなければ追加する
+    cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(grid_cache)")
+    }
+    if "apw_station_count" not in cols:
+        conn.execute(
+            "ALTER TABLE grid_cache ADD COLUMN apw_station_count INTEGER"
+        )
     conn.commit()
     return conn
 
@@ -66,7 +78,8 @@ def get_cache(
             """
             SELECT shape_ny, shape_nx,
                    tile_x_min, tile_x_max, tile_y_min, tile_y_max,
-                   field, apw_snapshot_at, apw_oldest_station_at, generated_at
+                   field, apw_snapshot_at, apw_oldest_station_at, generated_at,
+                   apw_station_count
             FROM grid_cache WHERE cache_key = ?
             """,
             (key,),
@@ -84,6 +97,7 @@ def get_cache(
         apw_snapshot_at=row[7],
         apw_oldest_station_at=row[8],
         generated_at=row[9],
+        apw_station_count=row[10],
     )
 
 
@@ -101,6 +115,7 @@ def put_cache(
     apw_oldest_station_at: str | None,
     generated_at: str,
     smoothing: float = 0.001,
+    apw_station_count: int | None = None,
 ) -> None:
     """グリッドデータをキャッシュに保存する。同一キーがあれば上書き。"""
     key = f"{datetime_hour}|{z}|{method}|{pollutant}|{smoothing:.6g}"
@@ -112,15 +127,27 @@ def put_cache(
             (cache_key, z, method, datetime_hour, pollutant,
              shape_ny, shape_nx,
              tile_x_min, tile_x_max, tile_y_min, tile_y_max,
-             field, apw_snapshot_at, apw_oldest_station_at, generated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             field, apw_snapshot_at, apw_oldest_station_at, generated_at,
+             apw_station_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                key, z, method, datetime_hour, pollutant,
-                field_f32.shape[0], field_f32.shape[1],
-                tile_x_min, tile_x_max, tile_y_min, tile_y_max,
+                key,
+                z,
+                method,
+                datetime_hour,
+                pollutant,
+                field_f32.shape[0],
+                field_f32.shape[1],
+                tile_x_min,
+                tile_x_max,
+                tile_y_min,
+                tile_y_max,
                 field_f32.tobytes(),
-                apw_snapshot_at, apw_oldest_station_at, generated_at,
+                apw_snapshot_at,
+                apw_oldest_station_at,
+                generated_at,
+                apw_station_count,
             ),
         )
         conn.commit()
