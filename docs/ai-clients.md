@@ -21,7 +21,7 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
 
 - **マスタ系**: `/v1/prefectures`, `/v1/stations`, `/v1/stations/{station_id}`
 - **観測値系**: `/v1/measurements`, `/v1/latest`
-- **メタ / 監視系**: `/v1/coverage`, `/v1/collect.log`, `/v1/log`
+- **メタ / 監視系**: `/v1/coverage`, `/v1/log`（JSON: 県別ステータス + ログ本文）
 
 `/v1/measurements` のレスポンス形式の詳細は  
 `docs/measurements-response-formats.md` もあわせて参照してください。
@@ -98,11 +98,10 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
 - **どこまで履歴が埋まっているか**
   - `GET /v1/coverage`（HTML）
 - **収集ジョブログ**
-  - `GET /v1/collect.log`（テキスト）
-  - `GET /v1/log`（ブラウザ用 HTML）
+  - `GET /v1/log`（JSON: 県別ステータス `status_items` と `collect_log` 本文）
 
 AI エージェントが自動運用を補助する場合、  
-「データがないことによるエラー」かどうか判断するために `/v1/coverage` や `/v1/collect.log` を併用するとよいです。
+「データがないことによるエラー」かどうか判断するために `/v1/coverage` や `/v1/log` を併用するとよいです。
 
 ---
 
