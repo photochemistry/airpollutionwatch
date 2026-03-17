@@ -1,5 +1,7 @@
 # airpollutionwatch API ドキュメント（日本語）
 
+このリポジトリに含まれていたフロントエンドのダッシュボードは、現在は別リポジトリ `photochemistry/airpollutionwatch-dashboard` に分離されています（ダッシュボードのコードやセットアップ手順はそちらを参照してください）。
+
 `airpollutionwatch` は、日本の各都道府県が公開している大気環境データを 1 時間ごとに収集し、  
 Web API 経由で参照できるようにするサービスです。
 
