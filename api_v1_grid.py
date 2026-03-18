@@ -31,7 +31,13 @@ from grid_cache import (
     put_cache,
     CACHE_TTL_HOURS,
 )
-from grid_interpolators import interpolate_atps, interpolate_linear, interpolate_tps
+from grid_interpolators import (
+    interpolate_atps,
+    interpolate_linear,
+    interpolate_tps,
+    interpolate_idw,
+    interpolate_nnatural,
+)
 from grid_utils import (
     BoundingBox,
     _webmercator_lonlat_to_tile_xy,
@@ -44,7 +50,7 @@ from stations_loader import get_stations_df
 JAPAN_BBOX = BoundingBox(min_lon=122.0, min_lat=24.0, max_lon=146.0, max_lat=46.0)
 
 AVAILABLE_ZOOM_LEVELS = [10, 11, 12, 13]
-AVAILABLE_METHODS = ["atps", "tps", "linear"]
+AVAILABLE_METHODS = ["atps", "tps", "linear", "idw", "nnatural"]
 AVAILABLE_POLLUTANTS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
 DEFAULT_METHOD = "atps"
 
