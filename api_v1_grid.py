@@ -232,6 +232,10 @@ def _get_or_compute_grid(
         field = interpolate_tps(lon, lat, values, lon2d, lat2d, smoothing=smoothing)
     elif method == "linear":
         field = interpolate_linear(lon, lat, values, lon2d, lat2d)
+    elif method == "idw":
+        field = interpolate_idw(lon, lat, values, lon2d, lat2d)
+    elif method == "nnatural":
+        field = interpolate_nnatural(lon, lat, values, lon2d, lat2d)
     else:
         raise HTTPException(status_code=400, detail=f"不明なメソッド: {method}")
 
