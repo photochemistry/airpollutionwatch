@@ -16,8 +16,9 @@ from fastapi_mcp import FastApiMCP
 
 import logging
 
-from api_v1 import router as v1_router
-from api_v1_grid import router as v1_grid_router
+from routers.v1 import router as v1_router
+from routers.grid import router as v1_grid_router
+from routers.amedas import router as v1_amedas_router
 
 ROOT = Path(__file__).resolve().parent
 DASHBOARD_DIST = ROOT / "dashboard" / "dist"
@@ -99,6 +100,7 @@ mcp.mount()
 
 app.include_router(v1_router)
 app.include_router(v1_grid_router)
+app.include_router(v1_amedas_router)
 
 # dashboard（Svelte ビルド）を同一ポートで配信
 if DASHBOARD_DIST.is_dir():
@@ -158,14 +160,16 @@ def _patch_uvicorn_invalid_request_logging() -> None:
 
 
 @app.on_event("startup")
-async def _setup_grid_logging() -> None:
-    """uvicorn の logging 設定完了後に api_v1_grid ロガーを接続する."""
-    grid_logger = logging.getLogger("api_v1_grid")
-    grid_logger.setLevel(logging.INFO)
-    if not grid_logger.handlers:
-        for handler in logging.getLogger("uvicorn").handlers:
-            grid_logger.addHandler(handler)
-        grid_logger.propagate = False
+async def _setup_logging() -> None:
+    """uvicorn の logging 設定完了後に各モジュールのロガーを接続する."""
+    uvicorn_handlers = logging.getLogger("uvicorn").handlers
+    for name in ("routers.grid", "routers.amedas", "data.amedas"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.INFO)
+        if not lg.handlers:
+            for handler in uvicorn_handlers:
+                lg.addHandler(handler)
+            lg.propagate = False
 
 
 # uvicorn が app をロードする前にプロトコルをパッチするため、uvicorn.run の直前に実行する

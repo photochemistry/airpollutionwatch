@@ -24,7 +24,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict
 
 from airpollutionwatch import prefecture_retrievers, ITEMSPECS
-from stations_loader import get_stations_df, PREF_NAME_TO_ID
+from data.stations import get_stations_df, PREF_NAME_TO_ID
 
 # 都道府県 ID → 日本語名
 PREF_ID_TO_NAME = {v: k for k, v in PREF_NAME_TO_ID.items()}
@@ -49,12 +49,12 @@ PREF_ID_TO_REGION: Dict[str, str] = {
     "okinawa": "沖縄",
 }
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "airpollutionwatch.sqlite3"
 GEOJSON_OUTLINES_DIR = ROOT / "geojson_outlines"
 COLLECT_LOG_PATH = ROOT / "collect.log"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
-PREF_LINKS_PATH = ROOT / ".." / "airpollutionwatch" / "pref-links.md"
+PREF_LINKS_PATH = ROOT / "airpollutionwatch" / "pref-links.md"
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
@@ -99,7 +99,7 @@ class PrefectureInfo(BaseModel):
     region: str = Field(..., description="地域ブロック（北海道・東北・関東・中部・近畿・中国・四国・九州・沖縄）")
 
 
-POLLUTANT_PARAM_TO_COL = {
+ITEM_PARAM_TO_COL = {
     "so2": "SO2", "no": "NO", "no2": "NO2", "nox": "NOX", "ox": "OX",
     "spm": "SPM", "pm25": "PM25", "co": "CO", "nmhc": "NMHC", "ch4": "CH4",
     "thc": "THC", "wd": "WD", "ws": "WS", "temp": "TEMP", "hum": "HUM",
@@ -126,7 +126,7 @@ class TimeSeriesPoint(BaseModel):
 
 class TimeSeriesSeries(BaseModel):
     station_id: str = Field(..., description="国環研局番 8 桁")
-    pollutant: str = Field(..., description="測定項目名 (PM25, OX など)")
+    item: str = Field(..., description="測定項目名 (PM25, OX など)")
     values: List[TimeSeriesPoint] = Field(default_factory=list)
 
 
@@ -295,7 +295,7 @@ async def get_measurements(
     pref: str | None = None,
     from_: datetime.datetime = Query(..., alias="from"),
     to: datetime.datetime = Query(...),
-    pollutants: str = Query("pm25,ox,no2"),
+    items: str = Query("pm25,ox,no2"),
     interval: str = Query("1h"),
     format: Literal["series", "snapshot"] = Query("series", description="series=時系列 / snapshot=1時刻・局単位（from=to の場合のみ）"),
 ):
@@ -330,10 +330,10 @@ async def get_measurements(
         raise HTTPException(status_code=400, detail="interval は raw または 1h のみ対応しています。")
 
     cols = []
-    for p in pollutants.lower().replace(" ", "").split(","):
+    for p in items.lower().replace(" ", "").split(","):
         p = p.strip()
-        if p and p in POLLUTANT_PARAM_TO_COL:
-            cols.append(POLLUTANT_PARAM_TO_COL[p])
+        if p and p in ITEM_PARAM_TO_COL:
+            cols.append(ITEM_PARAM_TO_COL[p])
     if not cols:
         cols = ["PM25", "OX", "NO2"]
 
@@ -415,7 +415,7 @@ async def get_measurements(
     for (code, col), points in sorted(series.items()):
         out.append(TimeSeriesSeries(
             station_id=_station_code_to_id(code),
-            pollutant=col,
+            item=col,
             values=[TimeSeriesPoint(datetime=dt, value=v) for dt, v in points],
         ))
     return TimeSeriesResponse(timeseries=out)
@@ -425,7 +425,7 @@ async def get_measurements(
 async def get_latest(
     station_ids: str | None = None,
     pref: str | None = None,
-    pollutants: str = "pm25,ox,no2",
+    items: str = "pm25,ox,no2",
 ):
     """指定した局（または都道府県内の全局）の直近の最新値。"""
     if station_ids and pref:
@@ -452,10 +452,10 @@ async def get_latest(
             raise HTTPException(status_code=400, detail="station_ids を 1 つ以上指定してください")
 
     cols = []
-    for p in pollutants.lower().replace(" ", "").split(","):
+    for p in items.lower().replace(" ", "").split(","):
         p = p.strip()
-        if p and p in POLLUTANT_PARAM_TO_COL:
-            cols.append(POLLUTANT_PARAM_TO_COL[p])
+        if p and p in ITEM_PARAM_TO_COL:
+            cols.append(ITEM_PARAM_TO_COL[p])
     if not cols:
         cols = ["PM25", "OX", "NO2"]
 

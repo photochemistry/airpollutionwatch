@@ -97,7 +97,7 @@ def get_stations_df() -> pd.DataFrame:
     初回のみパースし、以降はキャッシュを返す。
     """
     try:
-        from TM20210000 import STATIONS
+        from .TM20210000 import STATIONS
     except ImportError:
         return pd.DataFrame()
 

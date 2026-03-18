@@ -14,7 +14,7 @@ from typing import TypedDict
 
 import numpy as np
 
-CACHE_DB_PATH = Path(__file__).resolve().parent / "grid_cache.sqlite3"
+CACHE_DB_PATH = Path(__file__).resolve().parent.parent / "grid_cache.sqlite3"
 CACHE_TTL_HOURS = 72
 
 _DDL = """

@@ -22,8 +22,8 @@ import pandas as pd
 from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
 
-from api_v1 import DB_PATH, POLLUTANT_PARAM_TO_COL
-from grid_cache import (
+from routers.v1 import DB_PATH, ITEM_PARAM_TO_COL
+from grid.cache import (
     GridCacheEntry,
     evict_old_cache,
     get_cache,
@@ -31,27 +31,27 @@ from grid_cache import (
     put_cache,
     CACHE_TTL_HOURS,
 )
-from grid_interpolators import (
+from grid.interpolators import (
     interpolate_atps,
     interpolate_linear,
     interpolate_tps,
     interpolate_idw,
     interpolate_nnatural,
 )
-from grid_utils import (
+from grid.utils import (
     BoundingBox,
     _webmercator_lonlat_to_tile_xy,
     get_tile_bounds,
     make_lonlat_grid_tiles,
 )
-from stations_loader import get_stations_df
+from data.stations import get_stations_df
 
 # 日本全体をカバーする bounding box（沖縄〜北海道、対馬〜国後）
 JAPAN_BBOX = BoundingBox(min_lon=122.0, min_lat=24.0, max_lon=146.0, max_lat=46.0)
 
 AVAILABLE_ZOOM_LEVELS = [10, 11, 12, 13]
 AVAILABLE_METHODS = ["atps", "tps", "linear", "idw", "nnatural"]
-AVAILABLE_POLLUTANTS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
+AVAILABLE_ITEMS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
 DEFAULT_METHOD = "atps"
 
 router = APIRouter(prefix="/v1/grid", tags=["grid"])
@@ -65,7 +65,7 @@ class GridInfo(BaseModel):
     available_zoom_levels: List[int]
     default_method: str
     available_methods: List[str]
-    pollutants: List[str]
+    items: List[str]
     latest_grid_at: str | None
     latest_apw_snapshot_at: str | None
     cached_hours: int
@@ -94,7 +94,7 @@ class GridFieldResponse(BaseModel):
     z: int
     datetime: str
     method: str
-    pollutant: str
+    item: str
     tile_x_min: int
     tile_x_max: int
     tile_y_min: int
@@ -106,16 +106,16 @@ class GridFieldResponse(BaseModel):
 # 内部ヘルパー
 # ---------------------------------------------------------------------------
 
-def _fetch_station_snapshot(target_dt_iso: str, pollutant_col: str) -> pd.DataFrame:
+def _fetch_station_snapshot(target_dt_iso: str, item_col: str) -> pd.DataFrame:
     """
     全国の測定局について、指定時刻以前の最新測定値を取得する.
 
     Returns
     -------
-    DataFrame with columns: station_code, target_datetime, observed_datetime, {pollutant_col}
+    DataFrame with columns: station_code, target_datetime, observed_datetime, {item_col}
     """
     query = f"""
-        SELECT m.station_code, m.target_datetime, m.observed_datetime, m.{pollutant_col}
+        SELECT m.station_code, m.target_datetime, m.observed_datetime, m.{item_col}
         FROM measurements m
         INNER JOIN (
             SELECT station_code, MAX(target_datetime) AS max_dt
@@ -125,14 +125,14 @@ def _fetch_station_snapshot(target_dt_iso: str, pollutant_col: str) -> pd.DataFr
         ) latest
             ON  m.station_code    = latest.station_code
             AND m.target_datetime = latest.max_dt
-        WHERE m.{pollutant_col} IS NOT NULL
+        WHERE m.{item_col} IS NOT NULL
     """
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql_query(query, conn, params=(target_dt_iso,))
     return df
 
 
-def _fetch_station_count(target_dt_iso: str, pollutant_col: str) -> int:
+def _fetch_station_count(target_dt_iso: str, item_col: str) -> int:
     """指定時刻・物質の有効測定局数を返す（キャッシュ無効化判定用）。"""
     query = f"""
         SELECT COUNT(*) FROM measurements m
@@ -144,7 +144,7 @@ def _fetch_station_count(target_dt_iso: str, pollutant_col: str) -> int:
         ) latest
             ON  m.station_code    = latest.station_code
             AND m.target_datetime = latest.max_dt
-        WHERE m.{pollutant_col} IS NOT NULL
+        WHERE m.{item_col} IS NOT NULL
     """
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute(query, (target_dt_iso,)).fetchone()[0]
@@ -154,34 +154,34 @@ def _get_or_compute_grid(
     datetime_hour: str,
     z: int,
     method: str,
-    pollutant: str,
+    item: str,
     smoothing: float = 0.001,
 ) -> GridCacheEntry:
     """
     キャッシュから取得。なければ補間計算してキャッシュに保存し返す.
     collect で新データが入った場合は測定局数が変わるため、キャッシュを無効化して再計算する。
     """
-    pollutant_col = POLLUTANT_PARAM_TO_COL.get(pollutant)
-    cached = get_cache(datetime_hour, z, method, pollutant, smoothing)
-    if cached is not None and pollutant_col is not None:
+    item_col = ITEM_PARAM_TO_COL.get(item)
+    cached = get_cache(datetime_hour, z, method, item, smoothing)
+    if cached is not None and item_col is not None:
         # データ更新検知: 現在の DB の測定局数がキャッシュ作成時と異なれば無効化
         cached_count = cached.get("apw_station_count")
         if cached_count is not None:
-            current_count = _fetch_station_count(datetime_hour, pollutant_col)
+            current_count = _fetch_station_count(datetime_hour, item_col)
             if current_count != cached_count:
                 cached = None
     if cached is not None:
         return cached
 
-    if pollutant_col is None:
-        raise HTTPException(status_code=400, detail=f"不明な汚染物質: {pollutant}")
+    if item_col is None:
+        raise HTTPException(status_code=400, detail=f"不明な測定項目: {item}")
 
     # 全国スナップショットを DB から取得
-    meas_df = _fetch_station_snapshot(datetime_hour, pollutant_col)
+    meas_df = _fetch_station_snapshot(datetime_hour, item_col)
     if meas_df.empty:
         raise HTTPException(
             status_code=404,
-            detail=f"{datetime_hour} 時点の {pollutant} データがありません",
+            detail=f"{datetime_hour} 時点の {item} データがありません",
         )
 
     # 測定局の lat/lon と結合
@@ -194,19 +194,19 @@ def _get_or_compute_grid(
         on="station_id",
         how="inner",
     )
-    merged = merged.dropna(subset=["lat", "lon", pollutant_col])
-    merged[pollutant_col] = pd.to_numeric(merged[pollutant_col], errors="coerce")
-    merged = merged.dropna(subset=[pollutant_col])
+    merged = merged.dropna(subset=["lat", "lon", item_col])
+    merged[item_col] = pd.to_numeric(merged[item_col], errors="coerce")
+    merged = merged.dropna(subset=[item_col])
 
     if merged.empty:
         raise HTTPException(
             status_code=404,
-            detail=f"{datetime_hour} 時点の {pollutant} に有効な測定値がありません",
+            detail=f"{datetime_hour} 時点の {item} に有効な測定値がありません",
         )
 
     lon = merged["lon"].to_numpy(dtype=float)
     lat = merged["lat"].to_numpy(dtype=float)
-    values = merged[pollutant_col].to_numpy(dtype=float)
+    values = merged[item_col].to_numpy(dtype=float)
 
     apw_snapshot_at = str(merged["target_datetime"].max())
     apw_oldest_station_at = (
@@ -222,7 +222,7 @@ def _get_or_compute_grid(
     smoothing_desc = f"smoothing={smoothing}" if method in ("atps", "tps") else ""
     logger.info(
         "grid cache miss – computing: %s z=%d %s %s %s stations=%d",
-        datetime_hour, z, method, pollutant, smoothing_desc, len(values),
+        datetime_hour, z, method, item, smoothing_desc, len(values),
     )
     t0 = time.perf_counter()
 
@@ -245,12 +245,12 @@ def _get_or_compute_grid(
 
     logger.info(
         "grid cache updated: %s z=%d %s %s %s  shape=%s  %.2fs",
-        datetime_hour, z, method, pollutant, smoothing_desc,
+        datetime_hour, z, method, item, smoothing_desc,
         f"{field.shape[0]}x{field.shape[1]}", elapsed,
     )
 
     put_cache(
-        datetime_hour, z, method, pollutant,
+        datetime_hour, z, method, item,
         tile_x_min, tile_x_max, tile_y_min, tile_y_max,
         field.astype(np.float32),
         apw_snapshot_at, apw_oldest_station_at, generated_at,
@@ -301,7 +301,7 @@ async def grid_info():
         available_zoom_levels=AVAILABLE_ZOOM_LEVELS,
         default_method=DEFAULT_METHOD,
         available_methods=AVAILABLE_METHODS,
-        pollutants=AVAILABLE_POLLUTANTS,
+        items=AVAILABLE_ITEMS,
         latest_grid_at=latest_grid_at,
         latest_apw_snapshot_at=latest_apw_snapshot_at,
         cached_hours=CACHE_TTL_HOURS,
@@ -315,9 +315,9 @@ async def grid_snapshot(
         ...,
         description="x,y ペアをセミコロン区切り。例: 3550,1520;3551,1520",
     ),
-    pollutants: str = Query(
+    items: str = Query(
         "no2,ox,pm25",
-        description="カンマ区切りの汚染物質名（no2, ox, pm25, so2, no, nox, spm, co など）",
+        description="カンマ区切りの測定項目名（no2, ox, pm25, so2, no, nox, spm, co など）",
     ),
     datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
     method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
@@ -366,11 +366,11 @@ async def grid_snapshot(
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
-    # 汚染物質リスト
-    pollutant_list = [p.strip().lower() for p in pollutants.split(",") if p.strip()]
-    unknown = [p for p in pollutant_list if p not in POLLUTANT_PARAM_TO_COL]
+    # 測定項目リスト
+    item_list = [p.strip().lower() for p in items.split(",") if p.strip()]
+    unknown = [p for p in item_list if p not in ITEM_PARAM_TO_COL]
     if unknown:
-        raise HTTPException(status_code=400, detail=f"不明な汚染物質: {unknown}")
+        raise HTTPException(status_code=400, detail=f"不明な測定項目: {unknown}")
 
     # 各タイルの値を収集
     tile_values: dict[tuple[int, int], dict[str, float | None]] = {
@@ -380,8 +380,8 @@ async def grid_snapshot(
     apw_snapshot_at = None
     apw_oldest_station_at = None
 
-    for pollutant in pollutant_list:
-        entry = _get_or_compute_grid(dt_hour_iso, z, method, pollutant, smoothing)
+    for item in item_list:
+        entry = _get_or_compute_grid(dt_hour_iso, z, method, item, smoothing)
         if grid_generated_at is None:
             grid_generated_at = entry["generated_at"]
             apw_snapshot_at = entry["apw_snapshot_at"]
@@ -389,10 +389,10 @@ async def grid_snapshot(
         for tx, ty in tile_list:
             row, col = _tile_to_index(tx, ty, entry)
             if row is None:
-                tile_values[(tx, ty)][pollutant] = None
+                tile_values[(tx, ty)][item] = None
             else:
                 v = float(entry["field"][row, col])
-                tile_values[(tx, ty)][pollutant] = None if np.isnan(v) else v
+                tile_values[(tx, ty)][item] = None if np.isnan(v) else v
 
     tiles_out = [
         TileValue(x=tx, y=ty, values=tile_values[(tx, ty)])
@@ -412,7 +412,7 @@ async def grid_snapshot(
 @router.get("/field", response_model=GridFieldResponse)
 async def grid_field(
     z: int = Query(..., description="ズームレベル（12 または 14）"),
-    pollutant: str = Query(..., description="1 種類の汚染物質名"),
+    item: str = Query(..., description="1 種類の測定項目名"),
     datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
     bbox: str | None = Query(
         None,
@@ -433,9 +433,9 @@ async def grid_field(
             detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
         )
 
-    pollutant = pollutant.strip().lower()
-    if pollutant not in POLLUTANT_PARAM_TO_COL:
-        raise HTTPException(status_code=400, detail=f"不明な汚染物質: {pollutant}")
+    item = item.strip().lower()
+    if item not in ITEM_PARAM_TO_COL:
+        raise HTTPException(status_code=400, detail=f"不明な測定項目: {item}")
 
     try:
         dt = datetime.datetime.fromisoformat(datetime_)
@@ -447,7 +447,7 @@ async def grid_field(
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
-    entry = _get_or_compute_grid(dt_hour_iso, z, method, pollutant, smoothing)
+    entry = _get_or_compute_grid(dt_hour_iso, z, method, item, smoothing)
     field = entry["field"]
     tx_min = entry["tile_x_min"]
     tx_max = entry["tile_x_max"]
@@ -487,7 +487,7 @@ async def grid_field(
                 grid_generated_at=entry["generated_at"],
                 apw_snapshot_at=entry["apw_snapshot_at"],
                 apw_oldest_station_at=entry["apw_oldest_station_at"],
-                z=z, datetime=dt_hour_iso, method=method, pollutant=pollutant,
+                z=z, datetime=dt_hour_iso, method=method, item=item,
                 tile_x_min=bx_min, tile_x_max=bx_max,
                 tile_y_min=by_min, tile_y_max=by_max,
                 values=[],
@@ -517,7 +517,7 @@ async def grid_field(
         z=z,
         datetime=dt_hour_iso,
         method=method,
-        pollutant=pollutant,
+        item=item,
         tile_x_min=out_tx_min,
         tile_x_max=out_tx_max,
         tile_y_min=out_ty_min,
