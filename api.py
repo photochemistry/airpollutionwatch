@@ -50,7 +50,9 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 
 - `GET /v1/grid/info` — メタ情報・キャッシュ状況
 - `GET /v1/grid/snapshot` — 指定タイル群・1時刻の補間値（z, tiles, pollutants, datetime）
-- `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, pollutant, datetime, bbox）
+- `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, item/pollutant/items/pollutants, datetime, bbox）
+  - 複数項目はカンマ区切りで指定可能（例: `items=ox,pm25,no2`）
+  - レスポンスは `items` と `fields`（項目ごとの2次元配列）を返却
 
 ## 利用の流れ
 

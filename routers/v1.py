@@ -567,6 +567,40 @@ class LogOverviewResponse(BaseModel):
     )
 
 
+class PrefHistoryCell(BaseModel):
+    hour: int = Field(..., ge=0, le=23, description="時刻（0-23）")
+    has_data: bool = Field(..., description="当該日の当該時間にデータが存在するか")
+    status: Literal["ok", "missing"] = Field(..., description="ok=データあり, missing=欠損")
+
+
+class PrefHistoryDayRow(BaseModel):
+    date: str = Field(..., description="日付（YYYY-MM-DD, JST）")
+    cells: List[PrefHistoryCell] = Field(..., description="0-23時のセル")
+    ok_count: int = Field(..., description="当日のデータありスロット数")
+    missing_count: int = Field(..., description="当日の欠損スロット数")
+
+
+class PrefHistorySummary(BaseModel):
+    total_slots: int = Field(..., description="対象スロット総数（days*24）")
+    ok_slots: int = Field(..., description="データありスロット数")
+    missing_slots: int = Field(..., description="欠損スロット数")
+    coverage_ratio: float = Field(..., description="充足率（ok_slots/total_slots）")
+    oldest_continuous_datetime: str | None = Field(
+        None,
+        description="最新から1時間刻みで欠けなしに遡れる最古の時刻（JST）",
+    )
+
+
+class PrefLogHistoryResponse(BaseModel):
+    pref_id: str = Field(..., description="都道府県 ID")
+    name_ja: str = Field(..., description="都道府県名")
+    days: int = Field(..., description="対象日数")
+    start_datetime: str = Field(..., description="対象開始時刻（JST, ISO8601）")
+    end_datetime: str = Field(..., description="対象終了時刻（JST, ISO8601）")
+    rows: List[PrefHistoryDayRow] = Field(..., description="日ごとの〇×表データ")
+    summary: PrefHistorySummary
+
+
 def _load_pref_links() -> Dict[str, str]:
     """pref-links.md をパースし、県 ID → URL の辞書を返す。1行目はヘッダ、2行目以降は「県ID URL ...」形式。"""
     path = PREF_LINKS_PATH.resolve()
@@ -659,6 +693,27 @@ def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | Non
     return oldest_jst.isoformat(), round(delta_days, 1)
 
 
+def _parse_end_hour_utc(end_iso: str | None) -> datetime.datetime:
+    """
+    クエリ end を UTC の正時 datetime に正規化する。
+    未指定時は現在時刻（UTC）を使用。
+    """
+    if end_iso is None:
+        return datetime.datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    try:
+        dt = datetime.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="end の形式が不正です（ISO 8601 で指定してください）",
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=JST).astimezone(UTC)
+    else:
+        dt = dt.astimezone(UTC)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
 def _get_collection_status_items() -> List[CollectionStatusItem]:
     """各県の収集巡回状況を一覧で返す。collect.log が存在する場合は県ごとの状態（ok/warning/error）と代表メッセージを付与する。"""
     now = datetime.datetime.now(UTC)
@@ -720,6 +775,97 @@ async def collect_log_overview():
             collect_text = None
 
     return LogOverviewResponse(status_items=status_items, collect_log=collect_text)
+
+
+@router.get("/log/prefectures/{pref_id}/history", response_model=PrefLogHistoryResponse)
+async def collect_log_pref_history(
+    pref_id: str,
+    days: int = Query(30, ge=1, le=90, description="表示する過去日数（1-90）"),
+    end: str | None = Query(None, description="対象終了時刻（ISO8601）。省略時は現在時刻の正時"),
+):
+    """
+    指定県の過去巡回記録（days x 24 の〇×表）を返す。
+    """
+    if pref_id not in PREF_ID_TO_NAME:
+        raise HTTPException(status_code=404, detail=f"未知の都道府県 ID: {pref_id}")
+
+    end_hour_utc = _parse_end_hour_utc(end)
+    start_hour_utc = end_hour_utc - datetime.timedelta(hours=(days * 24 - 1))
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT target_datetime
+            FROM measurements
+            WHERE prefecture = ?
+            """,
+            (pref_id,),
+        )
+        existing_dt_utc: set[datetime.datetime] = set()
+        for row in cur.fetchall():
+            dt = _parse_db_datetime_utc(row[0])
+            if dt is None:
+                continue
+            if start_hour_utc <= dt <= end_hour_utc:
+                existing_dt_utc.add(dt.replace(minute=0, second=0, microsecond=0))
+
+        oldest_continuous_iso, _ = _oldest_continuous_target(cur, pref_id)
+
+    rows: List[PrefHistoryDayRow] = []
+    total_slots = days * 24
+    ok_slots = 0
+    missing_slots = 0
+
+    # 新しい日付から順に返す（ダッシュボードの最新監視に合わせる）
+    for day_offset in range(days):
+        day_jst = (end_hour_utc.astimezone(JST).date() - datetime.timedelta(days=day_offset))
+        cells: List[PrefHistoryCell] = []
+        day_ok = 0
+        day_missing = 0
+        for hour in range(24):
+            dt_jst = datetime.datetime.combine(day_jst, datetime.time(hour=hour, tzinfo=JST))
+            dt_utc = dt_jst.astimezone(UTC)
+            has_data = dt_utc in existing_dt_utc
+            if has_data:
+                day_ok += 1
+            else:
+                day_missing += 1
+            cells.append(
+                PrefHistoryCell(
+                    hour=hour,
+                    has_data=has_data,
+                    status="ok" if has_data else "missing",
+                )
+            )
+        ok_slots += day_ok
+        missing_slots += day_missing
+        rows.append(
+            PrefHistoryDayRow(
+                date=day_jst.isoformat(),
+                cells=cells,
+                ok_count=day_ok,
+                missing_count=day_missing,
+            )
+        )
+
+    coverage_ratio = (ok_slots / total_slots) if total_slots > 0 else 0.0
+
+    return PrefLogHistoryResponse(
+        pref_id=pref_id,
+        name_ja=PREF_ID_TO_NAME.get(pref_id, pref_id),
+        days=days,
+        start_datetime=start_hour_utc.astimezone(JST).isoformat(),
+        end_datetime=end_hour_utc.astimezone(JST).isoformat(),
+        rows=rows,
+        summary=PrefHistorySummary(
+            total_slots=total_slots,
+            ok_slots=ok_slots,
+            missing_slots=missing_slots,
+            coverage_ratio=round(coverage_ratio, 4),
+            oldest_continuous_datetime=oldest_continuous_iso,
+        ),
+    )
 
 
 @router.get("/meta/ai-docs", response_class=Response)

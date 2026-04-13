@@ -49,7 +49,7 @@ from data.stations import get_stations_df
 # 日本全体をカバーする bounding box（沖縄〜北海道、対馬〜国後）
 JAPAN_BBOX = BoundingBox(min_lon=122.0, min_lat=24.0, max_lon=146.0, max_lat=46.0)
 
-AVAILABLE_ZOOM_LEVELS = [10, 11, 12, 13]
+AVAILABLE_ZOOM_LEVELS = list(range(0, 14))  # 0..13
 AVAILABLE_METHODS = ["atps", "tps", "linear", "idw", "nnatural"]
 AVAILABLE_ITEMS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
 DEFAULT_METHOD = "atps"
@@ -94,12 +94,15 @@ class GridFieldResponse(BaseModel):
     z: int
     datetime: str
     method: str
-    item: str
+    items: List[str]
+    fields: Dict[str, List[List[float | None]]]
+    # 後方互換: 単一項目時に従来形式も返す
+    item: str | None = None
     tile_x_min: int
     tile_x_max: int
     tile_y_min: int
     tile_y_max: int
-    values: List[List[float | None]]
+    values: List[List[float | None]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +153,36 @@ def _fetch_station_count(target_dt_iso: str, item_col: str) -> int:
         return conn.execute(query, (target_dt_iso,)).fetchone()[0]
 
 
+def _fetch_station_snapshot_meta(target_dt_iso: str, item_col: str) -> tuple[int, str | None]:
+    """
+    指定時刻・物質の最新スナップショット要約を返す。
+
+    Returns
+    -------
+    (count, latest_target_datetime)
+      - count: 有効測定局数
+      - latest_target_datetime: JOIN 後データの最大 target_datetime（データがなければ None）
+    """
+    query = f"""
+        SELECT COUNT(*) AS count, MAX(m.target_datetime) AS latest_target_datetime
+        FROM measurements m
+        INNER JOIN (
+            SELECT station_code, MAX(target_datetime) AS max_dt
+            FROM measurements
+            WHERE target_datetime <= ?
+            GROUP BY station_code
+        ) latest
+            ON  m.station_code    = latest.station_code
+            AND m.target_datetime = latest.max_dt
+        WHERE m.{item_col} IS NOT NULL
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(query, (target_dt_iso,)).fetchone()
+    if row is None:
+        return 0, None
+    return int(row[0] or 0), row[1]
+
+
 def _get_or_compute_grid(
     datetime_hour: str,
     z: int,
@@ -164,12 +197,17 @@ def _get_or_compute_grid(
     item_col = ITEM_PARAM_TO_COL.get(item)
     cached = get_cache(datetime_hour, z, method, item, smoothing)
     if cached is not None and item_col is not None:
-        # データ更新検知: 現在の DB の測定局数がキャッシュ作成時と異なれば無効化
+        # データ更新検知:
+        # - 測定局数が変わった
+        # - 最新スナップショット時刻（MAX target_datetime）が進んだ
+        # のいずれかでキャッシュを無効化する。
         cached_count = cached.get("apw_station_count")
-        if cached_count is not None:
-            current_count = _fetch_station_count(datetime_hour, item_col)
-            if current_count != cached_count:
-                cached = None
+        cached_snapshot_at = cached.get("apw_snapshot_at")
+        current_count, current_snapshot_at = _fetch_station_snapshot_meta(datetime_hour, item_col)
+        if cached_count is not None and current_count != cached_count:
+            cached = None
+        elif cached_snapshot_at != current_snapshot_at:
+            cached = None
     if cached is not None:
         return cached
 
@@ -412,7 +450,10 @@ async def grid_snapshot(
 @router.get("/field", response_model=GridFieldResponse)
 async def grid_field(
     z: int = Query(..., description="ズームレベル（12 または 14）"),
-    item: str = Query(..., description="1 種類の測定項目名"),
+    item: str | None = Query(None, description="測定項目名（カンマ区切り可）"),
+    pollutant: str | None = Query(None, description="item のエイリアス（カンマ区切り可）"),
+    items: str | None = Query(None, description="測定項目名（カンマ区切り）"),
+    pollutants: str | None = Query(None, description="items のエイリアス（カンマ区切り）"),
     datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
     bbox: str | None = Query(
         None,
@@ -433,9 +474,27 @@ async def grid_field(
             detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
         )
 
-    item = item.strip().lower()
-    if item not in ITEM_PARAM_TO_COL:
-        raise HTTPException(status_code=400, detail=f"不明な測定項目: {item}")
+    # item / pollutant / items / pollutants のいずれでも受け付ける（重複は排除）
+    item_tokens: list[str] = []
+    for raw in (item, pollutant, items, pollutants):
+        if raw is None:
+            continue
+        for token in raw.split(","):
+            t = token.strip().lower()
+            if t:
+                item_tokens.append(t)
+    if not item_tokens:
+        raise HTTPException(status_code=400, detail="item / pollutant / items / pollutants のいずれかを指定してください")
+
+    # 順序維持でユニーク化
+    item_list: list[str] = []
+    for t in item_tokens:
+        if t not in item_list:
+            item_list.append(t)
+
+    unknown = [p for p in item_list if p not in ITEM_PARAM_TO_COL]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"不明な測定項目: {unknown}")
 
     try:
         dt = datetime.datetime.fromisoformat(datetime_)
@@ -447,12 +506,13 @@ async def grid_field(
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
-    entry = _get_or_compute_grid(dt_hour_iso, z, method, item, smoothing)
-    field = entry["field"]
-    tx_min = entry["tile_x_min"]
-    tx_max = entry["tile_x_max"]
-    ty_min = entry["tile_y_min"]
-    ty_max = entry["tile_y_max"]
+    # 最初の項目でタイル境界を取得（同 z なら同一）
+    first_item = item_list[0]
+    base_entry = _get_or_compute_grid(dt_hour_iso, z, method, first_item, smoothing)
+    tx_min = base_entry["tile_x_min"]
+    tx_max = base_entry["tile_x_max"]
+    ty_min = base_entry["tile_y_min"]
+    ty_max = base_entry["tile_y_max"]
 
     # 出力範囲の初期値（全国）
     out_tx_min, out_tx_max = tx_min, tx_max
@@ -484,10 +544,12 @@ async def grid_field(
 
         if bx_min > bx_max or by_min > by_max:
             return GridFieldResponse(
-                grid_generated_at=entry["generated_at"],
-                apw_snapshot_at=entry["apw_snapshot_at"],
-                apw_oldest_station_at=entry["apw_oldest_station_at"],
-                z=z, datetime=dt_hour_iso, method=method, item=item,
+                grid_generated_at=base_entry["generated_at"],
+                apw_snapshot_at=base_entry["apw_snapshot_at"],
+                apw_oldest_station_at=base_entry["apw_oldest_station_at"],
+                z=z, datetime=dt_hour_iso, method=method,
+                items=item_list,
+                fields={},
                 tile_x_min=bx_min, tile_x_max=bx_max,
                 tile_y_min=by_min, tile_y_max=by_max,
                 values=[],
@@ -503,24 +565,31 @@ async def grid_field(
     row_start = ty_max - out_ty_max   # より南側（tile y 大）が field の小さい row
     row_end   = ty_max - out_ty_min + 1
 
-    sub_field = field[row_start:row_end, col_start:col_end]
+    fields_2d: Dict[str, List[List[float | None]]] = {}
+    for target_item in item_list:
+        entry = _get_or_compute_grid(dt_hour_iso, z, method, target_item, smoothing)
+        sub_field = entry["field"][row_start:row_end, col_start:col_end]
+        fields_2d[target_item] = [
+            [None if np.isnan(v) else float(v) for v in row_arr]
+            for row_arr in sub_field
+        ]
 
-    values_2d: list[list[float | None]] = [
-        [None if np.isnan(v) else float(v) for v in row_arr]
-        for row_arr in sub_field
-    ]
+    legacy_item = item_list[0] if len(item_list) == 1 else None
+    legacy_values = fields_2d[legacy_item] if legacy_item is not None else None
 
     return GridFieldResponse(
-        grid_generated_at=entry["generated_at"],
-        apw_snapshot_at=entry["apw_snapshot_at"],
-        apw_oldest_station_at=entry["apw_oldest_station_at"],
+        grid_generated_at=base_entry["generated_at"],
+        apw_snapshot_at=base_entry["apw_snapshot_at"],
+        apw_oldest_station_at=base_entry["apw_oldest_station_at"],
         z=z,
         datetime=dt_hour_iso,
         method=method,
-        item=item,
+        items=item_list,
+        fields=fields_2d,
+        item=legacy_item,
         tile_x_min=out_tx_min,
         tile_x_max=out_tx_max,
         tile_y_min=out_ty_min,
         tile_y_max=out_ty_max,
-        values=values_2d,
+        values=legacy_values,
     )
