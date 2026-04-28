@@ -4,7 +4,7 @@
 エンドポイント:
   GET /v1/grid/info      — メタ情報・キャッシュ状況
   GET /v1/grid/snapshot  — 指定タイル群・1時刻の補間値
-  GET /v1/grid/field     — bbox 内全タイルの補間値（地図描画用）
+  GET /v1/grid/field     — bbox 内全タイルの補間値（後方互換）
 """
 
 from __future__ import annotations
@@ -288,6 +288,137 @@ def _tile_to_index(
     return row, col
 
 
+def _parse_tiles_param(tiles: str) -> list[tuple[int, int]]:
+    """tiles=x,y;x,y;... をパースしてタイル座標の配列を返す。"""
+    tile_list: list[tuple[int, int]] = []
+    for token in tiles.split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(",")
+        if len(parts) != 2:
+            raise HTTPException(
+                status_code=400, detail=f"tiles の形式が不正: {token!r}"
+            )
+        try:
+            tile_list.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"tiles の整数変換に失敗: {token!r}"
+            )
+    if not tile_list:
+        raise HTTPException(status_code=400, detail="tiles を 1 つ以上指定してください")
+    return tile_list
+
+
+def _build_grid_field_response(
+    entry: GridCacheEntry,
+    z: int,
+    datetime_hour_iso: str,
+    method: str,
+    item: str,
+    out_tx_min: int,
+    out_tx_max: int,
+    out_ty_min: int,
+    out_ty_max: int,
+) -> GridFieldResponse:
+    """全国フィールドから指定タイル範囲を切り出して返す。"""
+    tx_min = entry["tile_x_min"]
+    tx_max = entry["tile_x_max"]
+    ty_min = entry["tile_y_min"]
+    ty_max = entry["tile_y_max"]
+
+    if (
+        out_tx_min > out_tx_max
+        or out_ty_min > out_ty_max
+        or out_tx_max < tx_min
+        or out_tx_min > tx_max
+        or out_ty_max < ty_min
+        or out_ty_min > ty_max
+    ):
+        return GridFieldResponse(
+            grid_generated_at=entry["generated_at"],
+            apw_snapshot_at=entry["apw_snapshot_at"],
+            apw_oldest_station_at=entry["apw_oldest_station_at"],
+            z=z,
+            datetime=datetime_hour_iso,
+            method=method,
+            item=item,
+            tile_x_min=out_tx_min,
+            tile_x_max=out_tx_max,
+            tile_y_min=out_ty_min,
+            tile_y_max=out_ty_max,
+            values=[],
+        )
+
+    clip_tx_min = max(out_tx_min, tx_min)
+    clip_tx_max = min(out_tx_max, tx_max)
+    clip_ty_min = max(out_ty_min, ty_min)
+    clip_ty_max = min(out_ty_max, ty_max)
+
+    # col: tile_x_min=0 ... tile_x_max=nx-1 (west→east)
+    # row: tile_y_max=0 ... tile_y_min=ny-1 (south→north in field, tile y は北が小さい)
+    col_start = clip_tx_min - tx_min
+    col_end = clip_tx_max - tx_min + 1
+    row_start = ty_max - clip_ty_max
+    row_end = ty_max - clip_ty_min + 1
+
+    sub_field = entry["field"][row_start:row_end, col_start:col_end]
+    values_2d: list[list[float | None]] = [
+        [None if np.isnan(v) else float(v) for v in row_arr]
+        for row_arr in sub_field
+    ]
+
+    return GridFieldResponse(
+        grid_generated_at=entry["generated_at"],
+        apw_snapshot_at=entry["apw_snapshot_at"],
+        apw_oldest_station_at=entry["apw_oldest_station_at"],
+        z=z,
+        datetime=datetime_hour_iso,
+        method=method,
+        item=item,
+        tile_x_min=clip_tx_min,
+        tile_x_max=clip_tx_max,
+        tile_y_min=clip_ty_min,
+        tile_y_max=clip_ty_max,
+        values=values_2d,
+    )
+
+
+def _extract_tile_value_map(
+    entry: GridCacheEntry,
+    out_tx_min: int,
+    out_tx_max: int,
+    out_ty_min: int,
+    out_ty_max: int,
+) -> dict[tuple[int, int], float | None]:
+    """
+    指定タイル範囲の値を辞書で返す。
+    内部的には tiles/field と同じ切り出し処理を利用する。
+    """
+    sliced = _build_grid_field_response(
+        entry=entry,
+        z=0,  # 値抽出用途のため未使用
+        datetime_hour_iso="",
+        method="",
+        item="",
+        out_tx_min=out_tx_min,
+        out_tx_max=out_tx_max,
+        out_ty_min=out_ty_min,
+        out_ty_max=out_ty_max,
+    )
+    if not sliced.values:
+        return {}
+
+    value_map: dict[tuple[int, int], float | None] = {}
+    for row_idx, row_vals in enumerate(sliced.values):
+        ty = sliced.tile_y_max - row_idx
+        for col_idx, v in enumerate(row_vals):
+            tx = sliced.tile_x_min + col_idx
+            value_map[(tx, ty)] = v
+    return value_map
+
+
 # ---------------------------------------------------------------------------
 # エンドポイント
 # ---------------------------------------------------------------------------
@@ -335,25 +466,7 @@ async def grid_snapshot(
             detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
         )
 
-    # tiles パース
-    tile_list: list[tuple[int, int]] = []
-    for token in tiles.split(";"):
-        token = token.strip()
-        if not token:
-            continue
-        parts = token.split(",")
-        if len(parts) != 2:
-            raise HTTPException(
-                status_code=400, detail=f"tiles の形式が不正: {token!r}"
-            )
-        try:
-            tile_list.append((int(parts[0]), int(parts[1])))
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail=f"tiles の整数変換に失敗: {token!r}"
-            )
-    if not tile_list:
-        raise HTTPException(status_code=400, detail="tiles を 1 つ以上指定してください")
+    tile_list = _parse_tiles_param(tiles)
 
     # datetime パース・正時丸め
     try:
@@ -372,7 +485,12 @@ async def grid_snapshot(
     if unknown:
         raise HTTPException(status_code=400, detail=f"不明な測定項目: {unknown}")
 
-    # 各タイルの値を収集
+    out_tx_min = min(tx for tx, _ in tile_list)
+    out_tx_max = max(tx for tx, _ in tile_list)
+    out_ty_min = min(ty for _, ty in tile_list)
+    out_ty_max = max(ty for _, ty in tile_list)
+
+    # 各タイルの値を収集（内部的には tiles と同じ切り出し処理を利用）
     tile_values: dict[tuple[int, int], dict[str, float | None]] = {
         (tx, ty): {} for tx, ty in tile_list
     }
@@ -386,13 +504,15 @@ async def grid_snapshot(
             grid_generated_at = entry["generated_at"]
             apw_snapshot_at = entry["apw_snapshot_at"]
             apw_oldest_station_at = entry["apw_oldest_station_at"]
+        value_map = _extract_tile_value_map(
+            entry,
+            out_tx_min=out_tx_min,
+            out_tx_max=out_tx_max,
+            out_ty_min=out_ty_min,
+            out_ty_max=out_ty_max,
+        )
         for tx, ty in tile_list:
-            row, col = _tile_to_index(tx, ty, entry)
-            if row is None:
-                tile_values[(tx, ty)][item] = None
-            else:
-                v = float(entry["field"][row, col])
-                tile_values[(tx, ty)][item] = None if np.isnan(v) else v
+            tile_values[(tx, ty)][item] = value_map.get((tx, ty))
 
     tiles_out = [
         TileValue(x=tx, y=ty, values=tile_values[(tx, ty)])
@@ -448,7 +568,6 @@ async def grid_field(
     dt_hour_iso = dt_hour.isoformat()
 
     entry = _get_or_compute_grid(dt_hour_iso, z, method, item, smoothing)
-    field = entry["field"]
     tx_min = entry["tile_x_min"]
     tx_max = entry["tile_x_max"]
     ty_min = entry["tile_y_min"]
@@ -482,45 +601,9 @@ async def grid_field(
         by_min = max(int(math.floor(min(by_min_f, by_max_f))), ty_min)
         by_max = min(int(math.floor(max(by_min_f, by_max_f))), ty_max)
 
-        if bx_min > bx_max or by_min > by_max:
-            return GridFieldResponse(
-                grid_generated_at=entry["generated_at"],
-                apw_snapshot_at=entry["apw_snapshot_at"],
-                apw_oldest_station_at=entry["apw_oldest_station_at"],
-                z=z, datetime=dt_hour_iso, method=method, item=item,
-                tile_x_min=bx_min, tile_x_max=bx_max,
-                tile_y_min=by_min, tile_y_max=by_max,
-                values=[],
-            )
         out_tx_min, out_tx_max = bx_min, bx_max
         out_ty_min, out_ty_max = by_min, by_max
-
-    # フィールド配列から部分配列を切り出す
-    # col: tile_x_min=0 ... tile_x_max=nx-1 (west→east)
-    # row: tile_y_max=0 ... tile_y_min=ny-1 (south→north in field, tile y は北が小さい)
-    col_start = out_tx_min - tx_min
-    col_end   = out_tx_max - tx_min + 1
-    row_start = ty_max - out_ty_max   # より南側（tile y 大）が field の小さい row
-    row_end   = ty_max - out_ty_min + 1
-
-    sub_field = field[row_start:row_end, col_start:col_end]
-
-    values_2d: list[list[float | None]] = [
-        [None if np.isnan(v) else float(v) for v in row_arr]
-        for row_arr in sub_field
-    ]
-
-    return GridFieldResponse(
-        grid_generated_at=entry["generated_at"],
-        apw_snapshot_at=entry["apw_snapshot_at"],
-        apw_oldest_station_at=entry["apw_oldest_station_at"],
-        z=z,
-        datetime=dt_hour_iso,
-        method=method,
-        item=item,
-        tile_x_min=out_tx_min,
-        tile_x_max=out_tx_max,
-        tile_y_min=out_ty_min,
-        tile_y_max=out_ty_max,
-        values=values_2d,
+    return _build_grid_field_response(
+        entry, z, dt_hour_iso, method, item,
+        out_tx_min, out_tx_max, out_ty_min, out_ty_max,
     )
