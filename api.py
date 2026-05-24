@@ -50,7 +50,7 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 
 - `GET /v1/grid/info` — メタ情報・キャッシュ状況
 - `GET /v1/grid/snapshot` — 指定タイル群・1時刻の補間値（z, tiles, pollutants, datetime）
-- `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, pollutant, datetime, bbox）
+- `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, item または pollutant, datetime, bbox）。完成 JSON は grid_response_cache.sqlite3 に最大7日保持
 
 ## 利用の流れ
 
