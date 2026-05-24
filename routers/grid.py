@@ -4,13 +4,16 @@
 エンドポイント:
   GET /v1/grid/info      — メタ情報・キャッシュ状況
   GET /v1/grid/snapshot  — 指定タイル群・1時刻の補間値
-  GET /v1/grid/field     — bbox 内全タイルの補間値（地図描画用）
+  GET /v1/grid/field     — bbox 内全タイルの補間値（後方互換）
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import json
 import logging
+import math
 import sqlite3
 import time
 from typing import Dict, List
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Query, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from routers.v1 import DB_PATH, ITEM_PARAM_TO_COL
@@ -31,6 +35,8 @@ from grid.cache import (
     put_cache,
     CACHE_TTL_HOURS,
 )
+from grid.field_jobs import get_or_compute_field_response
+from grid.response_cache import evict_old_response_cache
 from grid.interpolators import (
     interpolate_atps,
     interpolate_linear,
@@ -326,6 +332,304 @@ def _tile_to_index(
     return row, col
 
 
+def _parse_tiles_param(tiles: str) -> list[tuple[int, int]]:
+    """tiles=x,y;x,y;... をパースしてタイル座標の配列を返す。"""
+    tile_list: list[tuple[int, int]] = []
+    for token in tiles.split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(",")
+        if len(parts) != 2:
+            raise HTTPException(
+                status_code=400, detail=f"tiles の形式が不正: {token!r}"
+            )
+        try:
+            tile_list.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"tiles の整数変換に失敗: {token!r}"
+            )
+    if not tile_list:
+        raise HTTPException(status_code=400, detail="tiles を 1 つ以上指定してください")
+    return tile_list
+
+
+def _build_grid_field_response(
+    entry: GridCacheEntry,
+    z: int,
+    datetime_hour_iso: str,
+    method: str,
+    item: str,
+    out_tx_min: int,
+    out_tx_max: int,
+    out_ty_min: int,
+    out_ty_max: int,
+) -> GridFieldResponse:
+    """全国フィールドから指定タイル範囲を切り出して返す。"""
+    tx_min = entry["tile_x_min"]
+    tx_max = entry["tile_x_max"]
+    ty_min = entry["tile_y_min"]
+    ty_max = entry["tile_y_max"]
+
+    if (
+        out_tx_min > out_tx_max
+        or out_ty_min > out_ty_max
+        or out_tx_max < tx_min
+        or out_tx_min > tx_max
+        or out_ty_max < ty_min
+        or out_ty_min > ty_max
+    ):
+        return GridFieldResponse(
+            grid_generated_at=entry["generated_at"],
+            apw_snapshot_at=entry["apw_snapshot_at"],
+            apw_oldest_station_at=entry["apw_oldest_station_at"],
+            z=z,
+            datetime=datetime_hour_iso,
+            method=method,
+            item=item,
+            tile_x_min=out_tx_min,
+            tile_x_max=out_tx_max,
+            tile_y_min=out_ty_min,
+            tile_y_max=out_ty_max,
+            values=[],
+        )
+
+    clip_tx_min = max(out_tx_min, tx_min)
+    clip_tx_max = min(out_tx_max, tx_max)
+    clip_ty_min = max(out_ty_min, ty_min)
+    clip_ty_max = min(out_ty_max, ty_max)
+
+    # col: tile_x_min=0 ... tile_x_max=nx-1 (west→east)
+    # row: tile_y_max=0 ... tile_y_min=ny-1 (south→north in field, tile y は北が小さい)
+    col_start = clip_tx_min - tx_min
+    col_end = clip_tx_max - tx_min + 1
+    row_start = ty_max - clip_ty_max
+    row_end = ty_max - clip_ty_min + 1
+
+    sub_field = entry["field"][row_start:row_end, col_start:col_end]
+    values_2d: list[list[float | None]] = [
+        [None if np.isnan(v) else float(v) for v in row_arr]
+        for row_arr in sub_field
+    ]
+
+    return GridFieldResponse(
+        grid_generated_at=entry["generated_at"],
+        apw_snapshot_at=entry["apw_snapshot_at"],
+        apw_oldest_station_at=entry["apw_oldest_station_at"],
+        z=z,
+        datetime=datetime_hour_iso,
+        method=method,
+        item=item,
+        tile_x_min=clip_tx_min,
+        tile_x_max=clip_tx_max,
+        tile_y_min=clip_ty_min,
+        tile_y_max=clip_ty_max,
+        values=values_2d,
+    )
+
+
+def _extract_tile_value_map(
+    entry: GridCacheEntry,
+    out_tx_min: int,
+    out_tx_max: int,
+    out_ty_min: int,
+    out_ty_max: int,
+) -> dict[tuple[int, int], float | None]:
+    """
+    指定タイル範囲の値を辞書で返す。
+    内部的には tiles/field と同じ切り出し処理を利用する。
+    """
+    sliced = _build_grid_field_response(
+        entry=entry,
+        z=0,  # 値抽出用途のため未使用
+        datetime_hour_iso="",
+        method="",
+        item="",
+        out_tx_min=out_tx_min,
+        out_tx_max=out_tx_max,
+        out_ty_min=out_ty_min,
+        out_ty_max=out_ty_max,
+    )
+    if not sliced.values:
+        return {}
+
+    value_map: dict[tuple[int, int], float | None] = {}
+    for row_idx, row_vals in enumerate(sliced.values):
+        ty = sliced.tile_y_max - row_idx
+        for col_idx, v in enumerate(row_vals):
+            tx = sliced.tile_x_min + col_idx
+            value_map[(tx, ty)] = v
+    return value_map
+
+
+def _resolve_field_items(
+    item: str | None = None,
+    pollutant: str | None = None,
+    items: str | None = None,
+    pollutants: str | None = None,
+) -> list[str]:
+    """item / pollutant / items / pollutants から測定項目リストを得る（順序維持・重複排除）。"""
+    item_tokens: list[str] = []
+    for raw in (item, pollutant, items, pollutants):
+        if raw is None:
+            continue
+        for token in raw.split(","):
+            t = token.strip().lower()
+            if t:
+                item_tokens.append(t)
+    if not item_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="item / pollutant / items / pollutants のいずれかを指定してください",
+        )
+    item_list: list[str] = []
+    for t in item_tokens:
+        if t not in item_list:
+            item_list.append(t)
+    unknown = [p for p in item_list if p not in ITEM_PARAM_TO_COL]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"不明な測定項目: {unknown}")
+    return item_list
+
+
+def _field_data_version(dt_hour_iso: str, items: list[str]) -> str:
+    """観測データ更新検知用。成分ごとの有効測定局数を連結する。"""
+    parts: list[str] = []
+    for item in items:
+        col = ITEM_PARAM_TO_COL[item]
+        parts.append(f"{item}:{_fetch_station_count(dt_hour_iso, col)}")
+    return ",".join(parts)
+
+
+def _field_response_cache_key(
+    dt_hour_iso: str,
+    z: int,
+    method: str,
+    items: list[str],
+    bbox: str | None,
+    smoothing: float,
+) -> str:
+    items_part = ",".join(sorted(items))
+    bbox_part = bbox.strip() if bbox else "national"
+    return (
+        f"grid_field|{dt_hour_iso}|z={z}|m={method}|items={items_part}"
+        f"|sm={smoothing:.6g}|bbox={bbox_part}"
+    )
+
+
+def _bbox_tile_range(
+    bbox: str,
+    z: int,
+    tx_min: int,
+    tx_max: int,
+    ty_min: int,
+    ty_max: int,
+) -> tuple[int, int, int, int]:
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        raise HTTPException(
+            status_code=400,
+            detail="bbox は min_lon,min_lat,max_lon,max_lat の形式で指定してください",
+        )
+    try:
+        bmin_lon, bmin_lat, bmax_lon, bmax_lat = (float(p) for p in parts)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bbox の数値変換に失敗しました")
+
+    bx_min_f, by_max_f = _webmercator_lonlat_to_tile_xy(bmin_lon, bmin_lat, z)
+    bx_max_f, by_min_f = _webmercator_lonlat_to_tile_xy(bmax_lon, bmax_lat, z)
+
+    out_tx_min = max(int(math.floor(min(bx_min_f, bx_max_f))), tx_min)
+    out_tx_max = min(int(math.floor(max(bx_min_f, bx_max_f))), tx_max)
+    out_ty_min = max(int(math.floor(min(by_min_f, by_max_f))), ty_min)
+    out_ty_max = min(int(math.floor(max(by_min_f, by_max_f))), ty_max)
+    return out_tx_min, out_tx_max, out_ty_min, out_ty_max
+
+
+def _compute_grid_field_body(
+    dt_hour_iso: str,
+    z: int,
+    method: str,
+    items: list[str],
+    bbox: str | None,
+    smoothing: float,
+) -> bytes:
+    """grid/field の JSON レスポンス body を生成する（同期・バックグラウンド用）。"""
+    first_entry = _get_or_compute_grid(dt_hour_iso, z, method, items[0], smoothing)
+    tx_min = first_entry["tile_x_min"]
+    tx_max = first_entry["tile_x_max"]
+    ty_min = first_entry["tile_y_min"]
+    ty_max = first_entry["tile_y_max"]
+
+    out_tx_min, out_tx_max = tx_min, tx_max
+    out_ty_min, out_ty_max = ty_min, ty_max
+    if bbox is not None:
+        out_tx_min, out_tx_max, out_ty_min, out_ty_max = _bbox_tile_range(
+            bbox, z, tx_min, tx_max, ty_min, ty_max
+        )
+
+    if len(items) == 1:
+        resp = _build_grid_field_response(
+            first_entry,
+            z,
+            dt_hour_iso,
+            method,
+            items[0],
+            out_tx_min,
+            out_tx_max,
+            out_ty_min,
+            out_ty_max,
+        )
+        return resp.model_dump_json().encode("utf-8")
+
+    fields: dict[str, list[list[float | None]]] = {}
+    grid_generated_at = first_entry["generated_at"]
+    apw_snapshot_at = first_entry["apw_snapshot_at"]
+    apw_oldest_station_at = first_entry["apw_oldest_station_at"]
+
+    for item in items:
+        entry = (
+            first_entry
+            if item == items[0]
+            else _get_or_compute_grid(dt_hour_iso, z, method, item, smoothing)
+        )
+        sliced = _build_grid_field_response(
+            entry,
+            z,
+            dt_hour_iso,
+            method,
+            item,
+            out_tx_min,
+            out_tx_max,
+            out_ty_min,
+            out_ty_max,
+        )
+        fields[item] = sliced.values
+        if grid_generated_at is None:
+            grid_generated_at = entry["generated_at"]
+        if apw_snapshot_at is None:
+            apw_snapshot_at = entry["apw_snapshot_at"]
+        if apw_oldest_station_at is None:
+            apw_oldest_station_at = entry["apw_oldest_station_at"]
+
+    payload = {
+        "grid_generated_at": grid_generated_at,
+        "apw_snapshot_at": apw_snapshot_at,
+        "apw_oldest_station_at": apw_oldest_station_at,
+        "z": z,
+        "datetime": dt_hour_iso,
+        "method": method,
+        "items": items,
+        "tile_x_min": out_tx_min,
+        "tile_x_max": out_tx_max,
+        "tile_y_min": out_ty_min,
+        "tile_y_max": out_ty_max,
+        "fields": fields,
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # エンドポイント
 # ---------------------------------------------------------------------------
@@ -334,6 +638,7 @@ def _tile_to_index(
 async def grid_info():
     """グリッド API のメタ情報・キャッシュ状況を返す。"""
     evict_old_cache()
+    evict_old_response_cache()
     latest_grid_at, latest_apw_snapshot_at = get_latest_info()
     return GridInfo(
         available_zoom_levels=AVAILABLE_ZOOM_LEVELS,
@@ -373,25 +678,7 @@ async def grid_snapshot(
             detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
         )
 
-    # tiles パース
-    tile_list: list[tuple[int, int]] = []
-    for token in tiles.split(";"):
-        token = token.strip()
-        if not token:
-            continue
-        parts = token.split(",")
-        if len(parts) != 2:
-            raise HTTPException(
-                status_code=400, detail=f"tiles の形式が不正: {token!r}"
-            )
-        try:
-            tile_list.append((int(parts[0]), int(parts[1])))
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail=f"tiles の整数変換に失敗: {token!r}"
-            )
-    if not tile_list:
-        raise HTTPException(status_code=400, detail="tiles を 1 つ以上指定してください")
+    tile_list = _parse_tiles_param(tiles)
 
     # datetime パース・正時丸め
     try:
@@ -410,7 +697,12 @@ async def grid_snapshot(
     if unknown:
         raise HTTPException(status_code=400, detail=f"不明な測定項目: {unknown}")
 
-    # 各タイルの値を収集
+    out_tx_min = min(tx for tx, _ in tile_list)
+    out_tx_max = max(tx for tx, _ in tile_list)
+    out_ty_min = min(ty for _, ty in tile_list)
+    out_ty_max = max(ty for _, ty in tile_list)
+
+    # 各タイルの値を収集（内部的には tiles と同じ切り出し処理を利用）
     tile_values: dict[tuple[int, int], dict[str, float | None]] = {
         (tx, ty): {} for tx, ty in tile_list
     }
@@ -424,13 +716,15 @@ async def grid_snapshot(
             grid_generated_at = entry["generated_at"]
             apw_snapshot_at = entry["apw_snapshot_at"]
             apw_oldest_station_at = entry["apw_oldest_station_at"]
+        value_map = _extract_tile_value_map(
+            entry,
+            out_tx_min=out_tx_min,
+            out_tx_max=out_tx_max,
+            out_ty_min=out_ty_min,
+            out_ty_max=out_ty_max,
+        )
         for tx, ty in tile_list:
-            row, col = _tile_to_index(tx, ty, entry)
-            if row is None:
-                tile_values[(tx, ty)][item] = None
-            else:
-                v = float(entry["field"][row, col])
-                tile_values[(tx, ty)][item] = None if np.isnan(v) else v
+            tile_values[(tx, ty)][item] = value_map.get((tx, ty))
 
     tiles_out = [
         TileValue(x=tx, y=ty, values=tile_values[(tx, ty)])
@@ -447,7 +741,7 @@ async def grid_snapshot(
     )
 
 
-@router.get("/field", response_model=GridFieldResponse)
+@router.get("/field")
 async def grid_field(
     z: int = Query(..., description="ズームレベル（12 または 14）"),
     item: str | None = Query(None, description="測定項目名（カンマ区切り可）"),
@@ -474,27 +768,7 @@ async def grid_field(
             detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
         )
 
-    # item / pollutant / items / pollutants のいずれでも受け付ける（重複は排除）
-    item_tokens: list[str] = []
-    for raw in (item, pollutant, items, pollutants):
-        if raw is None:
-            continue
-        for token in raw.split(","):
-            t = token.strip().lower()
-            if t:
-                item_tokens.append(t)
-    if not item_tokens:
-        raise HTTPException(status_code=400, detail="item / pollutant / items / pollutants のいずれかを指定してください")
-
-    # 順序維持でユニーク化
-    item_list: list[str] = []
-    for t in item_tokens:
-        if t not in item_list:
-            item_list.append(t)
-
-    unknown = [p for p in item_list if p not in ITEM_PARAM_TO_COL]
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"不明な測定項目: {unknown}")
+    item_list = _resolve_field_items(item, pollutant, items, pollutants)
 
     try:
         dt = datetime.datetime.fromisoformat(datetime_)
@@ -506,90 +780,34 @@ async def grid_field(
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
-    # 最初の項目でタイル境界を取得（同 z なら同一）
-    first_item = item_list[0]
-    base_entry = _get_or_compute_grid(dt_hour_iso, z, method, first_item, smoothing)
-    tx_min = base_entry["tile_x_min"]
-    tx_max = base_entry["tile_x_max"]
-    ty_min = base_entry["tile_y_min"]
-    ty_max = base_entry["tile_y_max"]
+    cache_key = _field_response_cache_key(
+        dt_hour_iso, z, method, item_list, bbox, smoothing
+    )
 
-    # 出力範囲の初期値（全国）
-    out_tx_min, out_tx_max = tx_min, tx_max
-    out_ty_min, out_ty_max = ty_min, ty_max
+    def _compute() -> bytes:
+        return _compute_grid_field_body(
+            dt_hour_iso, z, method, item_list, bbox, smoothing
+        )
 
-    # bbox が指定されている場合は範囲を絞り込む
-    if bbox is not None:
-        parts = bbox.split(",")
-        if len(parts) != 4:
-            raise HTTPException(
-                status_code=400,
-                detail="bbox は min_lon,min_lat,max_lon,max_lat の形式で指定してください",
-            )
-        try:
-            bmin_lon, bmin_lat, bmax_lon, bmax_lat = (float(p) for p in parts)
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="bbox の数値変換に失敗しました"
-            )
+    def _data_version() -> str:
+        return _field_data_version(dt_hour_iso, item_list)
 
-        bx_min_f, by_max_f = _webmercator_lonlat_to_tile_xy(bmin_lon, bmin_lat, z)
-        bx_max_f, by_min_f = _webmercator_lonlat_to_tile_xy(bmax_lon, bmax_lat, z)
-
-        import math
-        bx_min = max(int(math.floor(min(bx_min_f, bx_max_f))), tx_min)
-        bx_max = min(int(math.floor(max(bx_min_f, bx_max_f))), tx_max)
-        by_min = max(int(math.floor(min(by_min_f, by_max_f))), ty_min)
-        by_max = min(int(math.floor(max(by_min_f, by_max_f))), ty_max)
-
-        if bx_min > bx_max or by_min > by_max:
-            return GridFieldResponse(
-                grid_generated_at=base_entry["generated_at"],
-                apw_snapshot_at=base_entry["apw_snapshot_at"],
-                apw_oldest_station_at=base_entry["apw_oldest_station_at"],
-                z=z, datetime=dt_hour_iso, method=method,
-                items=item_list,
-                fields={},
-                tile_x_min=bx_min, tile_x_max=bx_max,
-                tile_y_min=by_min, tile_y_max=by_max,
-                values=[],
-            )
-        out_tx_min, out_tx_max = bx_min, bx_max
-        out_ty_min, out_ty_max = by_min, by_max
-
-    # フィールド配列から部分配列を切り出す
-    # col: tile_x_min=0 ... tile_x_max=nx-1 (west→east)
-    # row: tile_y_max=0 ... tile_y_min=ny-1 (south→north in field, tile y は北が小さい)
-    col_start = out_tx_min - tx_min
-    col_end   = out_tx_max - tx_min + 1
-    row_start = ty_max - out_ty_max   # より南側（tile y 大）が field の小さい row
-    row_end   = ty_max - out_ty_min + 1
-
-    fields_2d: Dict[str, List[List[float | None]]] = {}
-    for target_item in item_list:
-        entry = _get_or_compute_grid(dt_hour_iso, z, method, target_item, smoothing)
-        sub_field = entry["field"][row_start:row_end, col_start:col_end]
-        fields_2d[target_item] = [
-            [None if np.isnan(v) else float(v) for v in row_arr]
-            for row_arr in sub_field
-        ]
-
-    legacy_item = item_list[0] if len(item_list) == 1 else None
-    legacy_values = fields_2d[legacy_item] if legacy_item is not None else None
-
-    return GridFieldResponse(
-        grid_generated_at=base_entry["generated_at"],
-        apw_snapshot_at=base_entry["apw_snapshot_at"],
-        apw_oldest_station_at=base_entry["apw_oldest_station_at"],
-        z=z,
-        datetime=dt_hour_iso,
-        method=method,
-        items=item_list,
-        fields=fields_2d,
-        item=legacy_item,
-        tile_x_min=out_tx_min,
-        tile_x_max=out_tx_max,
-        tile_y_min=out_ty_min,
-        tile_y_max=out_ty_max,
-        values=legacy_values,
+    body, status, detail = await asyncio.to_thread(
+        lambda: get_or_compute_field_response(
+            cache_key,
+            _compute,
+            data_version_fn=_data_version,
+        )
+    )
+    if body is not None:
+        return Response(content=body, media_type="application/json")
+    if status == "pending":
+        raise HTTPException(
+            status_code=503,
+            detail=detail or "grid field is being computed; retry shortly",
+            headers={"Retry-After": "5"},
+        )
+    raise HTTPException(
+        status_code=500,
+        detail=detail or "grid field compute failed",
     )
