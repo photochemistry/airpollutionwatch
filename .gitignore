@@ -13,3 +13,6 @@ airpollutionwatch.sqlite3
 
 # dashboard ビルド成果物（FastAPI 相乗り時は api.py 起動前に npm run build で生成）
 dashboard/dist
+grid_response_cache.sqlite3-shm
+grid_response_cache.sqlite3-wal
+airpollutionwatch.sqlite3-journal

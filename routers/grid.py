@@ -16,7 +16,7 @@ import logging
 import math
 import sqlite3
 import time
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ from grid.interpolators import (
 from grid.utils import (
     BoundingBox,
     _webmercator_lonlat_to_tile_xy,
+    _webmercator_tile_xy_to_lonlat,
     get_tile_bounds,
     make_lonlat_grid_tiles,
 )
@@ -100,8 +101,8 @@ class GridFieldResponse(BaseModel):
     z: int
     datetime: str
     method: str
-    items: List[str]
-    fields: Dict[str, List[List[float | None]]]
+    items: List[str] | None = None
+    fields: Dict[str, List[List[float | None]]] | None = None
     # 後方互換: 単一項目時に従来形式も返す
     item: str | None = None
     tile_x_min: int
@@ -109,6 +110,9 @@ class GridFieldResponse(BaseModel):
     tile_y_min: int
     tile_y_max: int
     values: List[List[float | None]] | None = None
+    compute_domain: str | None = None
+    fallback_level: str | None = None
+    used_station_count: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +143,99 @@ def _fetch_station_snapshot(target_dt_iso: str, item_col: str) -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql_query(query, conn, params=(target_dt_iso,))
     return df
+
+
+def _prepare_station_arrays(
+    datetime_hour: str,
+    item: str,
+    *,
+    station_bbox: BoundingBox | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str, int]:
+    """補間に使う測定局配列を返す。station_bbox があれば局を空間フィルタする。"""
+    item_col = ITEM_PARAM_TO_COL.get(item)
+    if item_col is None:
+        raise HTTPException(status_code=400, detail=f"不明な測定項目: {item}")
+
+    meas_df = _fetch_station_snapshot(datetime_hour, item_col)
+    if meas_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{datetime_hour} 時点の {item} データがありません",
+        )
+
+    stations_df = get_stations_df()
+    meas_df["station_id"] = meas_df["station_code"].apply(lambda c: str(int(c)).zfill(8))
+    merged = meas_df.merge(
+        stations_df[["station_id", "lat", "lon"]],
+        on="station_id",
+        how="inner",
+    )
+    merged = merged.dropna(subset=["lat", "lon", item_col])
+    merged[item_col] = pd.to_numeric(merged[item_col], errors="coerce")
+    merged = merged.dropna(subset=[item_col])
+    if station_bbox is not None:
+        merged = merged[
+            (merged["lon"] >= station_bbox.min_lon)
+            & (merged["lon"] <= station_bbox.max_lon)
+            & (merged["lat"] >= station_bbox.min_lat)
+            & (merged["lat"] <= station_bbox.max_lat)
+        ]
+
+    if merged.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{datetime_hour} 時点の {item} に有効な測定値がありません",
+        )
+
+    lon = merged["lon"].to_numpy(dtype=float)
+    lat = merged["lat"].to_numpy(dtype=float)
+    values = merged[item_col].to_numpy(dtype=float)
+    apw_snapshot_at = str(merged["target_datetime"].max())
+    apw_oldest_station_at = (
+        str(merged["observed_datetime"].min())
+        if "observed_datetime" in merged.columns
+        else apw_snapshot_at
+    )
+    return lon, lat, values, apw_snapshot_at, apw_oldest_station_at, len(merged)
+
+
+def _parse_bbox(bbox: str) -> BoundingBox:
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        raise HTTPException(
+            status_code=400,
+            detail="bbox は min_lon,min_lat,max_lon,max_lat の形式で指定してください",
+        )
+    try:
+        bmin_lon, bmin_lat, bmax_lon, bmax_lat = (float(p) for p in parts)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bbox の数値変換に失敗しました")
+    return BoundingBox(
+        min_lon=min(bmin_lon, bmax_lon),
+        min_lat=min(bmin_lat, bmax_lat),
+        max_lon=max(bmin_lon, bmax_lon),
+        max_lat=max(bmin_lat, bmax_lat),
+    )
+
+
+def _expand_bbox_by_tiles(bbox: BoundingBox, z: int, margin_tiles: int) -> BoundingBox:
+    """タイル数ベースで bbox を拡張する。"""
+    if margin_tiles <= 0:
+        return bbox
+    tx_min, tx_max, ty_min, ty_max = get_tile_bounds(bbox, z)
+    n = 2**z
+    tx_min2 = max(0, tx_min - margin_tiles)
+    tx_max2 = min(n - 1, tx_max + margin_tiles)
+    ty_min2 = max(0, ty_min - margin_tiles)
+    ty_max2 = min(n - 1, ty_max + margin_tiles)
+    west_lon, north_lat = _webmercator_tile_xy_to_lonlat(tx_min2, ty_min2, z)
+    east_lon, south_lat = _webmercator_tile_xy_to_lonlat(tx_max2 + 1, ty_max2 + 1, z)
+    return BoundingBox(
+        min_lon=min(west_lon, east_lon),
+        min_lat=min(south_lat, north_lat),
+        max_lon=max(west_lon, east_lon),
+        max_lat=max(south_lat, north_lat),
+    )
 
 
 def _fetch_station_count(target_dt_iso: str, item_col: str) -> int:
@@ -526,16 +623,13 @@ def _bbox_tile_range(
     ty_min: int,
     ty_max: int,
 ) -> tuple[int, int, int, int]:
-    parts = bbox.split(",")
-    if len(parts) != 4:
-        raise HTTPException(
-            status_code=400,
-            detail="bbox は min_lon,min_lat,max_lon,max_lat の形式で指定してください",
-        )
-    try:
-        bmin_lon, bmin_lat, bmax_lon, bmax_lat = (float(p) for p in parts)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="bbox の数値変換に失敗しました")
+    parsed = _parse_bbox(bbox)
+    bmin_lon, bmin_lat, bmax_lon, bmax_lat = (
+        parsed.min_lon,
+        parsed.min_lat,
+        parsed.max_lon,
+        parsed.max_lat,
+    )
 
     bx_min_f, by_max_f = _webmercator_lonlat_to_tile_xy(bmin_lon, bmin_lat, z)
     bx_max_f, by_min_f = _webmercator_lonlat_to_tile_xy(bmax_lon, bmax_lat, z)
@@ -581,7 +675,9 @@ def _compute_grid_field_body(
             out_ty_min,
             out_ty_max,
         )
-        return resp.model_dump_json().encode("utf-8")
+        if hasattr(resp, "model_dump_json"):
+            return resp.model_dump_json().encode("utf-8")
+        return resp.json(ensure_ascii=False).encode("utf-8")
 
     fields: dict[str, list[list[float | None]]] = {}
     grid_generated_at = first_entry["generated_at"]
@@ -627,6 +723,91 @@ def _compute_grid_field_body(
         "tile_y_max": out_ty_max,
         "fields": fields,
     }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _compute_grid_field_body_local_bbox(
+    dt_hour_iso: str,
+    z: int,
+    method: str,
+    items: list[str],
+    bbox: str,
+    smoothing: float,
+    station_margin_tiles: int,
+    min_station_count: int,
+) -> bytes:
+    """grid/field の bbox 領域のみを直接補間して返す（高速化向け）。"""
+    target_bbox = _parse_bbox(bbox)
+    out_tx_min, out_tx_max, out_ty_min, out_ty_max = _bbox_tile_range(
+        bbox, z, 0, (2**z) - 1, 0, (2**z) - 1
+    )
+    lon2d, lat2d = make_lonlat_grid_tiles(target_bbox, z)
+    source_bbox = _expand_bbox_by_tiles(target_bbox, z, station_margin_tiles)
+
+    fields: dict[str, list[list[float | None]]] = {}
+    apw_snapshot_at = None
+    apw_oldest_station_at = None
+    used_station_count = None
+    fallback_level = "bbox"
+
+    for item in items:
+        try:
+            lon, lat, values, snap_at, oldest_at, station_count = _prepare_station_arrays(
+                dt_hour_iso, item, station_bbox=source_bbox
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            lon, lat, values, snap_at, oldest_at, station_count = _prepare_station_arrays(
+                dt_hour_iso, item, station_bbox=None
+            )
+            fallback_level = "national_station_set"
+        if station_count < min_station_count:
+            lon, lat, values, snap_at, oldest_at, station_count = _prepare_station_arrays(
+                dt_hour_iso, item, station_bbox=None
+            )
+            fallback_level = "national_station_set"
+        if method == "atps":
+            field = interpolate_atps(lon, lat, values, lon2d, lat2d, smoothing=smoothing)
+        elif method == "tps":
+            field = interpolate_tps(lon, lat, values, lon2d, lat2d, smoothing=smoothing)
+        elif method == "linear":
+            field = interpolate_linear(lon, lat, values, lon2d, lat2d)
+        elif method == "idw":
+            field = interpolate_idw(lon, lat, values, lon2d, lat2d)
+        elif method == "nnatural":
+            field = interpolate_nnatural(lon, lat, values, lon2d, lat2d)
+        else:
+            raise HTTPException(status_code=400, detail=f"不明なメソッド: {method}")
+
+        fields[item] = [
+            [None if np.isnan(v) else float(v) for v in row_arr]
+            for row_arr in field
+        ]
+        apw_snapshot_at = snap_at if apw_snapshot_at is None else apw_snapshot_at
+        apw_oldest_station_at = oldest_at if apw_oldest_station_at is None else apw_oldest_station_at
+        used_station_count = station_count if used_station_count is None else min(used_station_count, station_count)
+
+    payload = {
+        "grid_generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "apw_snapshot_at": apw_snapshot_at,
+        "apw_oldest_station_at": apw_oldest_station_at,
+        "z": z,
+        "datetime": dt_hour_iso,
+        "method": method,
+        "items": items,
+        "tile_x_min": out_tx_min,
+        "tile_x_max": out_tx_max,
+        "tile_y_min": out_ty_min,
+        "tile_y_max": out_ty_max,
+        "fields": fields,
+        "compute_domain": "bbox",
+        "fallback_level": fallback_level,
+        "used_station_count": used_station_count,
+    }
+    if len(items) == 1:
+        payload["item"] = items[0]
+        payload["values"] = fields[items[0]]
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
@@ -755,6 +936,22 @@ async def grid_field(
     ),
     method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
     smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+    compute_domain: Literal["national", "bbox"] = Query(
+        "national",
+        description="補間計算領域。national=全国計算(従来互換)、bbox=bbox領域のみ直接補間",
+    ),
+    station_margin_tiles: int = Query(
+        8,
+        ge=0,
+        le=256,
+        description="compute_domain=bbox のとき、観測局選定に使う bbox 拡張タイル数",
+    ),
+    min_station_count: int = Query(
+        16,
+        ge=1,
+        le=10000,
+        description="compute_domain=bbox のときの最小観測局数。未満なら全国局集合へ自動フォールバック",
+    ),
 ):
     """bbox 内の全タイルの補間値を返す（地図描画用）。bbox 省略時は全国。"""
     if z not in AVAILABLE_ZOOM_LEVELS:
@@ -780,11 +977,28 @@ async def grid_field(
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
+    if compute_domain == "bbox" and bbox is None:
+        raise HTTPException(
+            status_code=400,
+            detail="compute_domain=bbox のときは bbox を指定してください",
+        )
+
     cache_key = _field_response_cache_key(
         dt_hour_iso, z, method, item_list, bbox, smoothing
-    )
+    ) + f"|domain={compute_domain}|smg={station_margin_tiles}|msc={min_station_count}"
 
     def _compute() -> bytes:
+        if compute_domain == "bbox":
+            return _compute_grid_field_body_local_bbox(
+                dt_hour_iso,
+                z,
+                method,
+                item_list,
+                bbox,
+                smoothing,
+                station_margin_tiles,
+                min_station_count,
+            )
         return _compute_grid_field_body(
             dt_hour_iso, z, method, item_list, bbox, smoothing
         )
