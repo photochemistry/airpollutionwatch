@@ -53,7 +53,8 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
 - `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, item/pollutant/items/pollutants, datetime, bbox）
   - 複数項目はカンマ区切りで指定可能（例: `items=ox,pm25,no2`）
   - レスポンスは `items` と `fields`（項目ごとの2次元配列）を返却
-  - `compute_domain=bbox` を指定すると、bbox 領域のみ直接補間（高速化向け）。不足局時は全国局集合へフォールバック
+  - 既定は `compute_domain=national`（全国計算キャッシュを優先）
+- `GET /v1/grid/field/range` — bbox 内の複数時刻をまとめて返す（from/to,bbox 必須）
   - 完成 JSON は grid_response_cache.sqlite3 に最大7日保持
 
 ## 利用の流れ

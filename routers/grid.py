@@ -5,6 +5,7 @@
   GET /v1/grid/info      — メタ情報・キャッシュ状況
   GET /v1/grid/snapshot  — 指定タイル群・1時刻の補間値
   GET /v1/grid/field     — bbox 内全タイルの補間値（後方互換）
+  GET /v1/grid/field/range — bbox 内全タイルの補間値（複数時刻）
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ AVAILABLE_ZOOM_LEVELS = list(range(0, 14))  # 0..13
 AVAILABLE_METHODS = ["atps", "tps", "linear", "idw", "nnatural"]
 AVAILABLE_ITEMS = ["no2", "ox", "pm25", "so2", "no", "nox", "spm", "co", "nmhc", "temp", "hum"]
 DEFAULT_METHOD = "atps"
+AUTO_MARGIN_CANDIDATES = [2, 4, 8, 16, 24]
 
 router = APIRouter(prefix="/v1/grid", tags=["grid"])
 
@@ -811,6 +813,72 @@ def _compute_grid_field_body_local_bbox(
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def _compute_grid_field_body_auto_bbox(
+    dt_hour_iso: str,
+    z: int,
+    method: str,
+    items: list[str],
+    bbox: str,
+    smoothing: float,
+    min_station_count: int,
+    margin_candidates: list[int] | None = None,
+) -> bytes:
+    """bbox 指定時に、局数条件を満たす最小 margin を自動選択して補間する。"""
+    target_bbox = _parse_bbox(bbox)
+    candidates = margin_candidates or AUTO_MARGIN_CANDIDATES
+    # 項目ごとに必要 margin を見積もり、全項目の最大値を採用する
+    required_margin = 0
+    for item in items:
+        selected_for_item = candidates[-1]
+        for margin in candidates:
+            source_bbox = _expand_bbox_by_tiles(target_bbox, z, margin)
+            try:
+                _, _, _, _, _, station_count = _prepare_station_arrays(
+                    dt_hour_iso, item, station_bbox=source_bbox
+                )
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                station_count = 0
+            if station_count >= min_station_count:
+                selected_for_item = margin
+                break
+        required_margin = max(required_margin, selected_for_item)
+
+    body = _compute_grid_field_body_local_bbox(
+        dt_hour_iso=dt_hour_iso,
+        z=z,
+        method=method,
+        items=items,
+        bbox=bbox,
+        smoothing=smoothing,
+        station_margin_tiles=required_margin,
+        min_station_count=min_station_count,
+    )
+    payload = _parse_body_json(body)
+    payload["compute_domain"] = "auto-bbox"
+    payload["auto_selected_margin_tiles"] = required_margin
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _parse_body_json(body: bytes) -> dict:
+    return json.loads(body.decode("utf-8"))
+
+
+def _parse_iso_datetime_or_400(raw: str, *, field_name: str) -> datetime.datetime:
+    """ISO8601 文字列を datetime に変換する（末尾 Z も許容）。"""
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} の形式が不正（ISO 8601 で指定してください）",
+        )
+
+
 # ---------------------------------------------------------------------------
 # エンドポイント
 # ---------------------------------------------------------------------------
@@ -863,12 +931,9 @@ async def grid_snapshot(
 
     # datetime パース・正時丸め
     try:
-        dt = datetime.datetime.fromisoformat(datetime_)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="datetime の形式が不正（ISO 8601 で指定してください）",
-        )
+        dt = _parse_iso_datetime_or_400(datetime_, field_name="datetime")
+    except HTTPException:
+        raise
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
@@ -936,15 +1001,15 @@ async def grid_field(
     ),
     method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
     smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
-    compute_domain: Literal["national", "bbox"] = Query(
+    compute_domain: Literal["auto", "national", "bbox"] = Query(
         "national",
-        description="補間計算領域。national=全国計算(従来互換)、bbox=bbox領域のみ直接補間",
+        description="補間計算領域。national=全国計算（推奨）、auto=自動選択（bbox指定時は部分計算）、bbox=bbox領域のみ直接補間",
     ),
-    station_margin_tiles: int = Query(
-        8,
+    station_margin_tiles: int | None = Query(
+        None,
         ge=0,
         le=256,
-        description="compute_domain=bbox のとき、観測局選定に使う bbox 拡張タイル数",
+        description="compute_domain=bbox のとき、観測局選定に使う bbox 拡張タイル数。未指定時は自動",
     ),
     min_station_count: int = Query(
         16,
@@ -968,12 +1033,9 @@ async def grid_field(
     item_list = _resolve_field_items(item, pollutant, items, pollutants)
 
     try:
-        dt = datetime.datetime.fromisoformat(datetime_)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="datetime の形式が不正（ISO 8601 で指定してください）",
-        )
+        dt = _parse_iso_datetime_or_400(datetime_, field_name="datetime")
+    except HTTPException:
+        raise
     dt_hour = dt.replace(minute=0, second=0, microsecond=0)
     dt_hour_iso = dt_hour.isoformat()
 
@@ -988,7 +1050,20 @@ async def grid_field(
     ) + f"|domain={compute_domain}|smg={station_margin_tiles}|msc={min_station_count}"
 
     def _compute() -> bytes:
+        if compute_domain == "auto" and bbox is not None:
+            return _compute_grid_field_body_auto_bbox(
+                dt_hour_iso=dt_hour_iso,
+                z=z,
+                method=method,
+                items=item_list,
+                bbox=bbox,
+                smoothing=smoothing,
+                min_station_count=min_station_count,
+            )
         if compute_domain == "bbox":
+            resolved_margin = (
+                station_margin_tiles if station_margin_tiles is not None else 8
+            )
             return _compute_grid_field_body_local_bbox(
                 dt_hour_iso,
                 z,
@@ -996,7 +1071,7 @@ async def grid_field(
                 item_list,
                 bbox,
                 smoothing,
-                station_margin_tiles,
+                resolved_margin,
                 min_station_count,
             )
         return _compute_grid_field_body(
@@ -1024,4 +1099,119 @@ async def grid_field(
     raise HTTPException(
         status_code=500,
         detail=detail or "grid field compute failed",
+    )
+
+
+@router.get("/field/range")
+async def grid_field_range(
+    z: int = Query(..., description="ズームレベル（12 または 14）"),
+    item: str | None = Query(None, description="測定項目名（カンマ区切り可）"),
+    pollutant: str | None = Query(None, description="item のエイリアス（カンマ区切り可）"),
+    items: str | None = Query(None, description="測定項目名（カンマ区切り）"),
+    pollutants: str | None = Query(None, description="items のエイリアス（カンマ区切り）"),
+    from_datetime: str = Query(..., alias="from", description="開始時刻 ISO 8601（含む）"),
+    to_datetime: str = Query(..., alias="to", description="終了時刻 ISO 8601（含む）"),
+    bbox: str = Query(
+        ...,
+        description="min_lon,min_lat,max_lon,max_lat（レスポンス縮小のため必須）",
+    ),
+    method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
+    smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+):
+    """bbox 内グリッドを複数時刻まとめて返す。"""
+    if z not in AVAILABLE_ZOOM_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"z は {AVAILABLE_ZOOM_LEVELS} のいずれかにしてください",
+        )
+    if method not in AVAILABLE_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"method は {AVAILABLE_METHODS} のいずれかにしてください",
+        )
+    item_list = _resolve_field_items(item, pollutant, items, pollutants)
+
+    try:
+        dt_from = _parse_iso_datetime_or_400(from_datetime, field_name="from")
+        dt_to = _parse_iso_datetime_or_400(to_datetime, field_name="to")
+    except HTTPException:
+        raise
+    dt_from = dt_from.replace(minute=0, second=0, microsecond=0)
+    dt_to = dt_to.replace(minute=0, second=0, microsecond=0)
+    if dt_from > dt_to:
+        raise HTTPException(status_code=400, detail="from は to 以下にしてください")
+
+    # 安全のため上限を設ける（1時間刻み）
+    total_hours = int((dt_to - dt_from).total_seconds() // 3600) + 1
+    if total_hours > 72:
+        raise HTTPException(
+            status_code=400,
+            detail="取得期間が長すぎます。最大72時間までにしてください",
+        )
+
+    fields_by_datetime: dict[str, dict] = {}
+    timestamps: list[str] = []
+    stacked_values: dict[str, list[list[list[float | None]]]] = {
+        item_name: [] for item_name in item_list
+    }
+    grid_meta: dict | None = None
+    current = dt_from
+    while current <= dt_to:
+        dt_hour_iso = current.isoformat()
+        body = await asyncio.to_thread(
+            lambda: _compute_grid_field_body(
+                dt_hour_iso,
+                z,
+                method,
+                item_list,
+                bbox,
+                smoothing,
+            )
+        )
+        payload = _parse_body_json(body)
+        fields_by_datetime[dt_hour_iso] = payload
+        timestamps.append(dt_hour_iso)
+
+        if grid_meta is None:
+            gx_min = int(payload["tile_x_min"])
+            gx_max = int(payload["tile_x_max"])
+            gy_min = int(payload["tile_y_min"])
+            gy_max = int(payload["tile_y_max"])
+            grid_meta = {
+                "z": z,
+                "xMin": gx_min,
+                "xMax": gx_max,
+                "yMin": gy_min,
+                "yMax": gy_max,
+                "width": gx_max - gx_min + 1,
+                "height": gy_max - gy_min + 1,
+                # タイル格子の座標系を明示（地理院/OSM互換のWeb Mercator tile grid）
+                "crs": "WebMercatorTile",
+            }
+
+        payload_fields = payload.get("fields") or {}
+        if len(item_list) == 1 and (not payload_fields):
+            single_item = item_list[0]
+            payload_fields = {single_item: payload.get("values", [])}
+        for item_name in item_list:
+            stacked_values[item_name].append(payload_fields.get(item_name, []))
+        current += datetime.timedelta(hours=1)
+
+    response = {
+        "grid": grid_meta,
+        "z": z,
+        "from": dt_from.isoformat(),
+        "to": dt_to.isoformat(),
+        "method": method,
+        "items": item_list,
+        "bbox": bbox,
+        "count_hours": total_hours,
+        "timestamps": timestamps,
+        "values": stacked_values,
+        # 互換のため残す（従来実装を参照しているクライアント向け）
+        "series": fields_by_datetime,
+    }
+    return Response(
+        content=json.dumps(response, ensure_ascii=False),
+        media_type="application/json",
     )
