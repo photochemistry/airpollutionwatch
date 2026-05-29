@@ -224,10 +224,16 @@ REGION_ORDER = ("北海道", "東北", "関東", "中部", "近畿", "中国", "
 # --- エンドポイント ---
 
 
-@router.get("/geojson/outline/{pref_id}")
+@router.get(
+    "/geojson/outline/{pref_id}",
+    summary="都道府県輪郭",
+)
 async def geojson_outline(pref_id: str):
-    """指定都道府県の輪郭（簡略化済み）を rings 形式で返す。県単位表示・軽量化用。
-    scripts/generate_prefecture_outlines.py で geojson_outlines/{pref_id}.json を生成しておくこと。"""
+    """指定都道府県の境界線（簡略化済み）を GeoJSON rings 形式で返します。
+
+    地図上での県単位ハイライト表示に使用します。
+    データは `geojson_outlines/{pref_id}.json`（`scripts/generate_prefecture_outlines.py` で生成）。
+    """
     if pref_id not in PREF_ID_TO_NAME:
         raise HTTPException(status_code=404, detail=f"未知の都道府県 ID: {pref_id}")
     path = GEOJSON_OUTLINES_DIR / f"{pref_id}.json"
@@ -246,9 +252,13 @@ async def geojson_outline(pref_id: str):
     return data
 
 
-@router.get("/prefectures", response_model=List[PrefectureInfo])
+@router.get("/prefectures", response_model=List[PrefectureInfo], summary="都道府県一覧")
 async def prefectures():
-    """都道府県一覧を返す。全 47 都道府県について、ID・日本語名・データ取得可否・地域ブロック。"""
+    """全 47 都道府県の ID・日本語名・データ取得可否（has_data）・地域ブロック（region）を返します。
+
+    地域ブロック順・日本語名順でソートされています。
+    `has_data=true` の県のみ `/v1/measurements?pref=...` で観測値を取得できます。
+    """
     has_data_set = set(collection_prefecture_ids())
     items = []
     for pref_id in PREF_ID_TO_NAME:
@@ -265,12 +275,18 @@ async def prefectures():
     return items
 
 
-@router.get("/stations", response_model=List[StationListItem])
+@router.get("/stations", response_model=List[StationListItem], summary="測定局一覧")
 async def list_stations(
-    pref: str | None = None,
-    has: str | None = None,
+    pref: str | None = Query(None, description="都道府県 ID（例: tokyo）。省略時は全国"),
+    has: str | None = Query(
+        None,
+        description="観測項目のカンマ区切り（例: pm25,ox）。指定した項目を観測する局のみ返す",
+    ),
 ):
-    """測定局メタデータの一覧。クエリ `pref`・`has`（例: pm25,ox）で絞り込み可能。"""
+    """国環研測定局メタデータの一覧を返します。
+
+    データソースは TM20210000（メモリ上の DataFrame）。地図表示や局選択 UI のマスターデータとして利用します。
+    """
     df = get_stations_df()
     if df.empty:
         return []
@@ -286,9 +302,12 @@ async def list_stations(
     return [_series_to_station_item(subset.loc[i]) for i in subset.index]
 
 
-@router.get("/stations/{station_id}", response_model=StationDetail)
+@router.get("/stations/{station_id}", response_model=StationDetail, summary="測定局詳細")
 async def get_station(station_id: str):
-    """指定した測定局の詳細情報。"""
+    """指定した測定局の詳細情報（住所・局種別・各観測項目の有無など）を返します。
+
+    `station_id` は国環研局番（8 桁。先頭 0 は省略可）。
+    """
     try:
         sid = str(int(station_id)).zfill(8)
     except ValueError:
@@ -305,18 +324,36 @@ async def get_station(station_id: str):
 @router.get(
     "/measurements",
     response_model=Union[TimeSeriesResponse, HourlyResponse],
-    responses={200: {"description": "format=series のときは時系列リスト、format=snapshot のときは局単位のスナップショット"}},
+    summary="測定データ取得",
+    responses={200: {"description": "format=series のときは時系列、format=snapshot のときは局単位スナップショット"}},
 )
 async def get_measurements(
-    station_ids: str | None = None,
-    pref: str | None = None,
-    from_: datetime.datetime = Query(..., alias="from"),
-    to: datetime.datetime = Query(...),
-    items: str = Query("pm25,ox,no2"),
-    interval: str = Query("1h"),
-    format: Literal["series", "snapshot"] = Query("series", description="series=時系列 / snapshot=1時刻・局単位（from=to の場合のみ）"),
+    station_ids: str | None = Query(
+        None,
+        description="国環研局番のカンマ区切り（例: 13114010,13114510）。pref と同時指定不可",
+    ),
+    pref: str | None = Query(
+        None,
+        description="都道府県 ID（例: tokyo）。指定時はその県の全局を対象",
+    ),
+    from_: datetime.datetime = Query(..., alias="from", description="期間開始（ISO 8601。分以下は正時に丸め）"),
+    to: datetime.datetime = Query(..., description="期間終了（ISO 8601。分以下は正時に丸め）"),
+    items: str = Query(
+        "pm25,ox,no2",
+        description="測定項目のカンマ区切り（例: pm25,ox,no2）。so2,no,no2,nox,ox,spm,pm25,co,nmhc,ch4,thc,wd,ws,temp,hum",
+    ),
+    format: Literal["series", "snapshot"] = Query(
+        "series",
+        description="series=時系列（既定） / snapshot=1 時刻・局単位（from=to 必須）",
+    ),
 ):
-    """局（または県）・期間を指定して測定データ。format で時系列／スナップショットを切り替え。"""
+    """局（または都道府県）・期間を指定して測定データを取得します。
+
+    - **format=series**: (局, 測定項目) ごとの時系列配列。グラフ描画向け。
+    - **format=snapshot**: 指定時刻以前の局ごと最新値。地図・表の 1 時刻表示向け。
+
+    `station_ids` と `pref` のどちらか一方を指定してください。
+    """
     if station_ids and pref:
         raise HTTPException(status_code=400, detail="station_ids と pref は同時に指定できません")
     if not station_ids and not pref:
@@ -342,9 +379,6 @@ async def get_measurements(
             raise HTTPException(status_code=400, detail="station_ids は整数または 8 桁以内の数字で指定してください")
         if not codes:
             raise HTTPException(status_code=400, detail="station_ids を 1 つ以上指定してください")
-
-    if interval not in ("raw", "1h"):
-        raise HTTPException(status_code=400, detail="interval は raw または 1h のみ対応しています。")
 
     cols = []
     for p in items.lower().replace(" ", "").split(","):
@@ -438,13 +472,23 @@ async def get_measurements(
     return TimeSeriesResponse(timeseries=out)
 
 
-@router.get("/latest", response_model=LatestResponse)
+@router.get("/latest", response_model=LatestResponse, summary="最新値")
 async def get_latest(
-    station_ids: str | None = None,
-    pref: str | None = None,
-    items: str = "pm25,ox,no2",
+    station_ids: str | None = Query(
+        None,
+        description="国環研局番のカンマ区切り。pref と同時指定不可",
+    ),
+    pref: str | None = Query(None, description="都道府県 ID。指定時はその県の全局の最新値"),
+    items: str = Query(
+        "pm25,ox,no2",
+        description="測定項目のカンマ区切り（例: pm25,ox）",
+    ),
 ):
-    """指定した局（または都道府県内の全局）の直近の最新値。"""
+    """指定した局、または都道府県内の全局について、直近の最新値を返します。
+
+    対象局集合内で最も新しい `target_datetime` のデータを返します。
+    ダッシュボードや「いま」の状況表示ウィジェット向け。
+    """
     if station_ids and pref:
         raise HTTPException(status_code=400, detail="station_ids と pref は同時に指定できません")
     if not station_ids and not pref:
@@ -505,47 +549,6 @@ async def get_latest(
             values[col] = float(val) if val is not None and not (isinstance(val, float) and np.isnan(val)) else None
         stations_out.append(LatestStationValues(station_id=_station_code_to_id(code), values=values))
     return LatestResponse(datetime=latest, stations=stations_out)
-
-
-@router.get("/coverage", response_class=Response)
-async def coverage():
-    """県ごとに「どこまで過去にさかのぼって連続データがあるか」を HTML テーブルで返す。"""
-    now = datetime.datetime.now().astimezone()
-    base_hour = now.replace(minute=0, second=0, microsecond=0)
-    rows: list[tuple[str, str, str]] = []
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        for pref in collection_prefecture_ids():
-            cur.execute("SELECT DISTINCT target_datetime FROM measurements WHERE prefecture = ?", (pref,))
-            result = [r[0] for r in cur.fetchall()]
-            if not result:
-                rows.append((pref, "データなし", "—"))
-                continue
-            dts = sorted(datetime.datetime.fromisoformat(s) for s in result)
-            dt_set = set(dts)
-            latest = max(dts)
-            cur_dt = latest
-            oldest = latest
-            one_hour = datetime.timedelta(hours=1)
-            while cur_dt in dt_set:
-                oldest = cur_dt
-                cur_dt -= one_hour
-            delta_days = (base_hour - oldest).total_seconds() / 86400.0
-            rows.append((pref, oldest.isoformat(), f"{delta_days:.1f} 日前"))
-
-    html_parts = [
-        "<!DOCTYPE html>", "<html lang='ja'>", "<head>", "  <meta charset='utf-8'>",
-        "  <title>県別データ連続期間</title>",
-        "  <style>body { font-family: system-ui, sans-serif; margin: 1.5rem; } table { border-collapse: collapse; width: 100%; max-width: 960px; } th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; font-size: 0.9rem; } th { background: #f0f0f0; } tbody tr:nth-child(odd) { background: #fafafa; }</style>",
-        "</head>", "<body>",
-        f"  <h1>県別の連続取得開始時刻（{base_hour.isoformat()} 時点）</h1>",
-        "  <table>", "    <thead>", "      <tr><th>県</th><th>連続区間の最古の target_datetime</th><th>現在からの距離</th></tr>", "    </thead>", "    <tbody>",
-    ]
-    for pref, oldest_iso, days_str in rows:
-        html_parts.append(f"      <tr><td>{pref}</td><td>{oldest_iso}</td><td>{days_str}</td></tr>")
-    html_parts += ["    </tbody>", "  </table>", "</body>", "</html>"]
-    return Response(content="\n".join(html_parts), media_type="text/html; charset=utf-8")
 
 
 class CollectionStatusItem(BaseModel):
@@ -779,9 +782,15 @@ def _get_collection_status_items() -> List[CollectionStatusItem]:
     return result
 
 
-@router.get("/log", response_model=LogOverviewResponse)
+@router.get("/log", response_model=LogOverviewResponse, summary="収集ログ概要")
 async def collect_log_overview():
-    """収集ジョブログの概要を JSON で返す。県別巡回状況（status_items）と collect.log 本文（collect_log）を含む。"""
+    """収集ジョブの概要を JSON で返します。
+
+    - **status_items**: 県ごとの収集状況（最新時刻・連続データ期間・log 上の warning/error 等）
+    - **collect_log**: `collect.log` の全文（存在しない場合は null）
+
+    データ欠損の原因調査や運用監視に使用します。
+    """
     status_items = _get_collection_status_items()
 
     collect_text: str | None = None
@@ -794,14 +803,20 @@ async def collect_log_overview():
     return LogOverviewResponse(status_items=status_items, collect_log=collect_text)
 
 
-@router.get("/log/prefectures/{pref_id}/history", response_model=PrefLogHistoryResponse)
+@router.get(
+    "/log/prefectures/{pref_id}/history",
+    response_model=PrefLogHistoryResponse,
+    summary="県別収集履歴",
+)
 async def collect_log_pref_history(
     pref_id: str,
-    days: int = Query(30, ge=1, le=90, description="表示する過去日数（1-90）"),
-    end: str | None = Query(None, description="対象終了時刻（ISO8601）。省略時は現在時刻の正時"),
+    days: int = Query(30, ge=1, le=90, description="表示する過去日数（1〜90）"),
+    end: str | None = Query(None, description="対象終了時刻（ISO 8601）。省略時は現在時刻の正時"),
 ):
-    """
-    指定県の過去巡回記録（days x 24 の〇×表）を返す。
+    """指定都道府県の過去収集履歴を、日×24 時間の充足表（〇×）として返します。
+
+    各セルは当該日時に `measurements` データが存在するかを示します。
+    `summary.coverage_ratio` で期間全体の充足率を確認できます。
     """
     if pref_id not in PREF_ID_TO_NAME:
         raise HTTPException(status_code=404, detail=f"未知の都道府県 ID: {pref_id}")
@@ -885,9 +900,12 @@ async def collect_log_pref_history(
     )
 
 
-@router.get("/meta/ai-docs", response_class=Response)
+@router.get("/meta/ai-docs", response_class=Response, summary="AI クライアント向けガイド")
 async def ai_docs():
-    """LLM / AI クライアント向けガイド (docs/ai-clients.md) を Markdown として返す。"""
+    """LLM / AI クライアント向けの利用ガイド（`docs/ai-clients.md`）を Markdown として返します。
+
+    ChatGPT や Cursor などが API を呼び出す際の参照用ドキュメントです。
+    """
     if not AI_DOC_PATH.exists():
         raise HTTPException(status_code=404, detail="ai-clients.md not found")
     try:

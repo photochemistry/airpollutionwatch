@@ -12,9 +12,11 @@ Web API 経由で参照できるようにするサービスです。
 ## API の概要
 
 - **ベース URL**: `https://andersan.net:8089`
-- **API ドキュメント**: `https://andersan.net:8089/docs`  
-  FastAPI 標準の Swagger UI が表示されます（説明文は日本語）。
+- **API ドキュメント（完全版）**: `https://andersan.net:8089/docs`  
+  FastAPI 標準の Swagger UI。全エンドポイント・パラメータ・スキーマを日本語で参照できます。
 - **バージョン**: 現行のエンドポイントは **v1** として `/v1/...` にあります（例: `/v1/prefectures`, `/v1/measurements`）。
+
+> **Note**: この README は主要エンドポイントの簡易ガイドです。グリッド API（`/v1/grid`）やアメダス（`/v1/amedas`）なども含めた完全なリファレンスは Swagger UI（`/docs`）を参照してください。
 
 提供する主な機能:
 
@@ -94,12 +96,11 @@ poetry run python api.py
   - `pref`: 都道府県 ID。指定した場合、その県内の全局を対象とする。
   - `from`: 期間の開始日時（ISO 8601 形式）。
   - `to`: 期間の終了日時（ISO 8601 形式）。`format=snapshot` のときは `from` と同一時刻を指定すること。
-  - `pollutants`: 測定項目のカンマ区切り（既定: `pm25,ox,no2`）。指定可能: so2, no, no2, nox, ox, spm, pm25, co, nmhc, ch4, thc, wd, ws, temp, hum。
-  - `interval`: 現状は `1h` または `raw`。`24h` は未対応。
-  - `format`: `series`（既定）＝時系列形式。`snapshot`＝1 時刻の局単位配列（1 時間フォールバック付き）。
+  - `items`: 測定項目のカンマ区切り（既定: `pm25,ox,no2`）。指定可能: so2, no, no2, nox, ox, spm, pm25, co, nmhc, ch4, thc, wd, ws, temp, hum。
+  - `format`: `series`（既定）＝時系列形式。`snapshot`＝1 時刻の局単位配列（指定時刻以前の局ごと最新値）。
 - **レスポンス**:
-  - `format=series`: `timeseries` 配列。各要素は `station_id`・`pollutant`・`values`（`{ datetime, value }` の配列）。
-  - `format=snapshot`: `target_datetime`・`actual_datetime`・`data`（局ごとの配列）・`spec`。
+  - `format=series`: `timeseries` 配列。各要素は `station_id`・`item`・`values`（`{ datetime, value }` の配列）。
+  - `format=snapshot`: `target_datetime`・`data`（局ごとの配列）・`spec`。
 
 #### レスポンス形式（series と snapshot）— 軸の取り方
 
@@ -117,23 +118,8 @@ poetry run python api.py
 curl "https://andersan.net:8089/v1/measurements?station_ids=13114010,13114510&from=2024-09-03T00:00:00%2B09:00&to=2024-09-03T06:00:00%2B09:00"
 
 # 県指定・1 時刻スナップショット（局単位配列・フォールバック付き）
-curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00:00%2B09:00&to=2024-09-03T06:00:00%2B09:00&format=snapshot&pollutants=pm25,ox,no2"
+curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00:00%2B09:00&to=2024-09-03T06:00:00%2B09:00&format=snapshot&items=pm25,ox,no2"
 ```
-
----
-
-### `GET /v1/coverage`
-
-- **説明**: 各都道府県ごとに、どこまで過去にさかのぼって連続データがあるかを HTML テーブルで返します。
-- **詳細**:
-  - `measurements` テーブルから県別の `target_datetime` を集計し、
-  - もっとも新しい時刻から 1 時間ずつさかのぼって「途切れずに存在する最古の時刻」を求めます。
-  - 現在の正時から見た日数差も計算して表示します。
-- **用途**:
-  - どの県の履歴がどのくらい埋まっているかの可視化。
-  - cron やスクレイパの不調により、どこかの県だけ欠けていないかをブラウザでざっと確認したいとき。
-
-ブラウザで `https://andersan.net:8089/v1/coverage` にアクセスしてください。
 
 ---
 
@@ -150,7 +136,7 @@ curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00
 
 ### `GET /v1/stations`（局メタデータ一覧）【実装済み】
 
-- **説明**: 取得可能な測定局（station）の一覧を返します。データソースは国環研の測定局一覧（TM20210000）を SQLite に変換したものです。
+- **説明**: 取得可能な測定局（station）の一覧を返します。データソースは国環研の測定局一覧（TM20210000）です。
 - **クエリパラメータ**:
   - `pref`: 都道府県 ID（例: `tokyo`）。指定がなければ全国。
   - `has`: `pm25,ox` のようにカンマ区切りで指定すると、その測定項目を観測している局のみ返します。指定可能: `pm25`, `ox`, `so2`, `no`, `no2`, `nox`, `co`, `spm`, `nmhc`, `ch4`, `thc`, `wd`, `ws`, `temp`, `hum`。
@@ -173,7 +159,7 @@ curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00
 - **クエリパラメータ**:
   - `station_ids`: 国環研局番のカンマ区切り。**`pref` とどちらか一方のみ指定可。**
   - `pref`: 都道府県 ID。指定した場合、その都道府県に属する局の最新値を返す。
-  - `pollutants`: 測定項目のカンマ区切り（例: `pm25,ox`）。
+  - `items`: 測定項目のカンマ区切り（例: `pm25,ox`）。
 - **レスポンス**: `datetime`（対象とした最新の target_datetime）、`stations`（局ごとの `station_id` と `values` 辞書）。
 - **用途**: ダッシュボードやウィジェットで「いま」の状況を表示する。
 
@@ -213,7 +199,7 @@ curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00
 ## 注意事項
 
 - 各都道府県のウェブサイト仕様変更により、突然データ取得に失敗することがあります。  
-  `/v1/log` や `/v1/coverage` を併用して状態を確認してください。
+  `/v1/log` を併用して状態を確認してください。
 - 00 時ちょうどのデータが存在しない県については、前日 24 時の値になる場合があります。
 
 現時点では、次の 3 県については API 対応が完了していません（今後対応予定です）。

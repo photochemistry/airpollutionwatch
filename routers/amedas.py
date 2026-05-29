@@ -17,7 +17,7 @@ from typing import Dict, List
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from amedas_cache import evict_old_cache, get_cache, put_cache
 from data.amedas import AVAILABLE_ITEMS, fetch_amedas_df
@@ -45,37 +45,51 @@ router = APIRouter(prefix="/v1/amedas", tags=["amedas"])
 
 
 class AmedasFieldResponse(BaseModel):
-    datetime: str
-    method: str
-    items: List[str]
-    z: int
-    tile_x_min: int
-    tile_x_max: int
-    tile_y_min: int
-    tile_y_max: int
-    fields: Dict[str, List[List[float | None]]]
+    datetime: str = Field(..., description="対象時刻（ISO 8601、正時）")
+    method: str = Field(..., description="使用した補間メソッド")
+    items: List[str] = Field(..., description="返却した気象要素名のリスト")
+    z: int = Field(..., description="ズームレベル")
+    tile_x_min: int = Field(..., description="出力タイル X の最小値")
+    tile_x_max: int = Field(..., description="出力タイル X の最大値")
+    tile_y_min: int = Field(..., description="出力タイル Y の最小値")
+    tile_y_max: int = Field(..., description="出力タイル Y の最大値")
+    fields: Dict[str, List[List[float | None]]] = Field(
+        ...,
+        description="気象要素ごとの 2 次元補間値配列",
+    )
 
 
-@router.get("", response_model=AmedasFieldResponse)
+@router.get("", response_model=AmedasFieldResponse, summary="アメダス補間グリッド")
 async def amedas_field(
-    z: int = Query(..., description=f"ズームレベル（{AVAILABLE_ZOOM_LEVELS_AMEDAS} のいずれか）"),
+    z: int = Query(..., description=f"ズームレベル（{AVAILABLE_ZOOM_LEVELS_AMEDAS[0]}〜{AVAILABLE_ZOOM_LEVELS_AMEDAS[-1]}）"),
     items: str = Query(
         "temp,hum,wx,wy",
-        description=f"カンマ区切りの気象要素。指定可能: {', '.join(AVAILABLE_ITEMS)}",
+        description=f"気象要素のカンマ区切り。指定可能: {', '.join(AVAILABLE_ITEMS)}",
     ),
-    datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601（正時に丸められる）"),
+    datetime_: str = Query(..., alias="datetime", description="対象時刻（ISO 8601。正時に丸め）"),
     bbox: str | None = Query(
         None,
-        description="min_lon,min_lat,max_lon,max_lat（省略時は全国）",
+        description="出力範囲 min_lon,min_lat,max_lon,max_lat。省略時は全国",
     ),
-    method: str = Query(DEFAULT_METHOD, description=f"補間メソッド: {', '.join(AVAILABLE_METHODS)}"),
-    smoothing: float = Query(0.001, description="atps / tps の平滑化強度（0 で厳密補間）"),
+    method: str = Query(
+        DEFAULT_METHOD,
+        description=f"補間メソッド: {', '.join(AVAILABLE_METHODS)}",
+    ),
+    smoothing: float = Query(
+        0.001,
+        description="atps / tps の平滑化強度（0=厳密補間）",
+    ),
 ):
-    """
-    JMAアメダス観測データをグリッド補間して返す（地図描画用）。
+    """JMA アメダス観測データを空間補間し、地理院タイル座標系の 2 次元グリッドで返します。
 
-    大気測定局データ（/v1/grid）とは独立したデータソースです。
-    気象要素は temp（気温℃）、hum（湿度%）、wx/wy（風ベクトル成分 m/s）です。
+    大気測定局データ（`/v1/grid`）とは**独立したデータソース**です。混在しません。
+
+    主な気象要素:
+    - **temp**: 気温（℃）
+    - **hum**: 湿度（%）
+    - **wx / wy**: 風ベクトル成分（m/s）
+
+    地図への気象レイヤー重ね合わせに使用します。
     """
     if z not in AVAILABLE_ZOOM_LEVELS_AMEDAS:
         raise HTTPException(

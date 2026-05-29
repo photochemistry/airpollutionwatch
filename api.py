@@ -12,7 +12,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi_mcp import FastApiMCP
 
 import logging
 
@@ -27,49 +26,83 @@ with open(ROOT / "pyproject.toml", "rb") as f:
     project = tomllib.load(f)
 
 APP_DESCRIPTION = """
-airpollutionwatch は、日本全国の都道府県が公開している大気汚染データを
-1時間ごとに収集し、共通スキーマで提供するための Web API です。
+日本全国の都道府県が公開する大気環境データ（1 時間ごと）を収集し、共通スキーマ（そらまめ互換）で提供する Web API です。
 
 - **リポジトリ**: https://github.com/vitroid/airpollutionwatch-api
+- **簡易ガイド**: リポジトリ内 `README.md`
 
-## API バージョン
+## タグ（API グループ）
 
-- **v1** (`/v1/...`): 現行のエンドポイント（都道府県・測定局・測定データ・収集ログなど）
-- **v1/grid** (`/v1/grid/...`): グリッドAPI（空間補間による地理院タイル単位の測定値）
+| タグ | プレフィックス | 内容 |
+|------|----------------|------|
+| **v1** | `/v1/...` | 都道府県・測定局・観測値・収集ログなど基本 API |
+| **grid** | `/v1/grid/...` | 大気測定局データの空間補間グリッド（地理院タイル座標） |
+| **amedas** | `/v1/amedas` | JMA アメダス気象データの空間補間グリッド |
 
-## 主なエンドポイント（v1）
+## v1 — 基本 API
 
-- `GET /v1/prefectures` — 都道府県一覧（id・日本語名・has_data・region）
-- `GET /v1/measurements` — 局（または県）・期間で測定データ。`format=series` / `format=snapshot`
-- `GET /v1/stations` — 測定局メタデータ一覧。`pref`・`has` で絞り込み
-- `GET /v1/stations/{station_id}` — 局詳細
-- `GET /v1/latest` — 指定局または県内の直近最新値
-- `GET /v1/coverage` — 県別の連続データ期間（HTML）
-- `GET /v1/log` — 収集ジョブログの概要を **JSON** で返す（県別巡回状況 `status_items` と `collect_log` 本文）
+| メソッド | パス | 概要 |
+|----------|------|------|
+| GET | `/v1/prefectures` | 都道府県一覧（id・日本語名・has_data・region） |
+| GET | `/v1/stations` | 測定局メタデータ一覧（`pref`・`has` で絞り込み） |
+| GET | `/v1/stations/{station_id}` | 測定局詳細（住所・観測項目の有無など） |
+| GET | `/v1/measurements` | 局または県・期間の測定データ（`format=series` / `snapshot`） |
+| GET | `/v1/latest` | 局または県の直近最新値 |
+| GET | `/v1/log` | 収集ジョブログ概要（県別 `status_items` + `collect_log` 全文） |
+| GET | `/v1/log/prefectures/{pref_id}/history` | 指定県の収集履歴（日×24 時間の充足表） |
+| GET | `/v1/geojson/outline/{pref_id}` | 都道府県輪郭（地図表示用 GeoJSON rings） |
+| GET | `/v1/meta/ai-docs` | LLM 向け利用ガイド（Markdown） |
 
-## グリッドエンドポイント（v1/grid）
+## grid — 大気汚染グリッド API
 
-- `GET /v1/grid/info` — メタ情報・キャッシュ状況
-- `GET /v1/grid/snapshot` — 指定タイル群・1時刻の補間値（z, tiles, pollutants, datetime）
-- `GET /v1/grid/field` — bbox 内全タイルの補間値・地図描画用（z, item/pollutant/items/pollutants, datetime, bbox）
-  - 複数項目はカンマ区切りで指定可能（例: `items=ox,pm25,no2`）
-  - レスポンスは `items` と `fields`（項目ごとの2次元配列）を返却
-  - 既定は `compute_domain=national`（全国計算キャッシュを優先）
-- `GET /v1/grid/range` — bbox 内の複数時刻をまとめて返す（from/to,bbox 必須、`/field/range` の短縮エイリアス）
-- `GET /v1/grid/field/range` — bbox 内の複数時刻をまとめて返す（from/to,bbox 必須）
-  - 完成 JSON は grid_response_cache.sqlite3 に最大7日保持
+観測局の点データを空間補間し、地理院タイル座標系の 2 次元配列で返します。地図への色塗り・ヒートマップ描画向け。
 
-## 利用の流れ
+| メソッド | パス | 概要 |
+|----------|------|------|
+| GET | `/v1/grid/info` | 利用可能なズーム・補間法・キャッシュ状況 |
+| GET | `/v1/grid/snapshot` | 指定タイル座標リスト・1 時刻の補間値 |
+| GET | `/v1/grid/field` | bbox 内・1 時刻の補間グリッド（地図描画の主用途） |
+| GET | `/v1/grid/range` | bbox 内・複数時刻の補間グリッド（最大 72 時間） |
 
-1. `/v1/prefectures` で都道府県一覧を確認
-2. `/v1/measurements?pref=...&from=...&to=...` で測定データを取得
-3. 測定項目の意味・単位はレスポンスの `spec` を参照
+**主なクエリ**: `z`（ズーム 0〜13）, `datetime`, `items`（例: `ox,pm25,no2`）, `bbox`, `method`（atps / tps / linear / idw / nnatural）
+
+## amedas — 気象グリッド API
+
+JMA アメダス観測データを `/v1/grid` と同様のタイル座標系で返します。大気データとは独立したデータソースです。
+
+| メソッド | パス | 概要 |
+|----------|------|------|
+| GET | `/v1/amedas` | bbox 内の気象補間グリッド（temp / hum / wx / wy など） |
+
+## 典型的な利用の流れ
+
+1. `/v1/prefectures` で都道府県 ID を確認
+2. `/v1/stations?pref=...` で局一覧を取得
+3. `/v1/measurements?pref=...&from=...&to=...&items=pm25` で時系列を取得
+4. 地図表示には `/v1/grid/field?z=12&datetime=...&items=ox&bbox=...` を使用
+5. 収集状況の確認には `/v1/log` の `status_items` を参照
 """
+
+OPENAPI_TAGS = [
+    {
+        "name": "v1",
+        "description": "都道府県・測定局・観測値・収集ログなど、大気汚染データの基本 API（`/v1/...`）",
+    },
+    {
+        "name": "grid",
+        "description": "大気測定局データの空間補間グリッド。地理院タイル座標系で 2 次元配列を返す（`/v1/grid/...`）",
+    },
+    {
+        "name": "amedas",
+        "description": "JMA アメダス気象データの空間補間グリッド。大気 grid API とは独立（`/v1/amedas`）",
+    },
+]
 
 app = FastAPI(
     title="airpollutionwatch API",
     description=APP_DESCRIPTION,
     version=project.get("project", {}).get("version", "0.0.0"),
+    openapi_tags=OPENAPI_TAGS,
 )
 
 # favicon.ico（漢字「氣」）を返すエンドポイント
@@ -101,9 +134,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-mcp = FastApiMCP(app)
-mcp.mount()
 
 app.include_router(v1_router)
 app.include_router(v1_grid_router)

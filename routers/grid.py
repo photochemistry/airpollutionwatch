@@ -6,7 +6,6 @@
   GET /v1/grid/snapshot  — 指定タイル群・1時刻の補間値
   GET /v1/grid/field     — bbox 内全タイルの補間値（後方互換）
   GET /v1/grid/range     — bbox 内全タイルの補間値（複数時刻・推奨）
-  GET /v1/grid/field/range — bbox 内全タイルの補間値（複数時刻）
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from routers.v1 import DB_PATH, ITEM_PARAM_TO_COL
 from grid.cache import (
@@ -72,13 +71,13 @@ router = APIRouter(prefix="/v1/grid", tags=["grid"])
 # ---------------------------------------------------------------------------
 
 class GridInfo(BaseModel):
-    available_zoom_levels: List[int]
-    default_method: str
-    available_methods: List[str]
-    items: List[str]
-    latest_grid_at: str | None
-    latest_apw_snapshot_at: str | None
-    cached_hours: int
+    available_zoom_levels: List[int] = Field(..., description="利用可能なズームレベル（0〜13）")
+    default_method: str = Field(..., description="既定の補間メソッド")
+    available_methods: List[str] = Field(..., description="利用可能な補間メソッド一覧")
+    items: List[str] = Field(..., description="補間対象の測定項目一覧")
+    latest_grid_at: str | None = Field(None, description="グリッドキャッシュの最新生成時刻")
+    latest_apw_snapshot_at: str | None = Field(None, description="元データ（観測値）の最新スナップショット時刻")
+    cached_hours: int = Field(..., description="キャッシュ保持時間（時間）")
 
 
 class TileValue(BaseModel):
@@ -1081,9 +1080,13 @@ def _parse_iso_datetime_or_400(raw: str, *, field_name: str) -> datetime.datetim
 # エンドポイント
 # ---------------------------------------------------------------------------
 
-@router.get("/info", response_model=GridInfo)
+@router.get("/info", response_model=GridInfo, summary="グリッド API メタ情報")
 async def grid_info():
-    """グリッド API のメタ情報・キャッシュ状況を返す。"""
+    """グリッド API のメタ情報とキャッシュ状況を返します。
+
+    利用可能なズームレベル・補間メソッド・測定項目、およびキャッシュの最新状態を確認できます。
+    リクエスト時に期限切れキャッシュの掃除も行います。
+    """
     evict_old_cache()
     evict_old_response_cache()
     latest_grid_at, latest_apw_snapshot_at = get_latest_info()
@@ -1098,22 +1101,32 @@ async def grid_info():
     )
 
 
-@router.get("/snapshot", response_model=GridSnapshotResponse)
+@router.get("/snapshot", response_model=GridSnapshotResponse, summary="タイル指定スナップショット")
 async def grid_snapshot(
-    z: int = Query(..., description="ズームレベル（12 または 14）"),
+    z: int = Query(..., description=f"ズームレベル（{AVAILABLE_ZOOM_LEVELS[0]}〜{AVAILABLE_ZOOM_LEVELS[-1]}）"),
     tiles: str = Query(
         ...,
-        description="x,y ペアをセミコロン区切り。例: 3550,1520;3551,1520",
+        description="タイル座標 x,y のセミコロン区切りリスト。例: 3550,1520;3551,1520",
     ),
     items: str = Query(
         "no2,ox,pm25",
-        description="カンマ区切りの測定項目名（no2, ox, pm25, so2, no, nox, spm, co など）",
+        description=f"測定項目のカンマ区切り。指定可能: {', '.join(AVAILABLE_ITEMS)}",
     ),
-    datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
-    method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
-    smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+    datetime_: str = Query(..., alias="datetime", description="対象時刻（ISO 8601。正時に丸め）"),
+    method: str = Query(
+        DEFAULT_METHOD,
+        description=f"補間メソッド: {', '.join(AVAILABLE_METHODS)}",
+    ),
+    smoothing: float = Query(
+        0.001,
+        description="atps / tps の平滑化強度（0=厳密補間、大きいほど滑らか）",
+    ),
 ):
-    """指定タイル群・1 時刻の補間値スナップショットを返す。"""
+    """指定した地理院タイル座標リストについて、1 時刻の補間値を返します。
+
+    少数タイルだけ値が欲しい場合に `/field` より軽量です。
+    地図全体の描画には `/field` を推奨します。
+    """
     if z not in AVAILABLE_ZOOM_LEVELS:
         raise HTTPException(
             status_code=400,
@@ -1185,38 +1198,48 @@ async def grid_snapshot(
     )
 
 
-@router.get("/field")
+@router.get("/field", summary="補間グリッド（1 時刻）")
 async def grid_field(
-    z: int = Query(..., description="ズームレベル（12 または 14）"),
-    item: str | None = Query(None, description="測定項目名（カンマ区切り可）"),
-    pollutant: str | None = Query(None, description="item のエイリアス（カンマ区切り可）"),
-    items: str | None = Query(None, description="測定項目名（カンマ区切り）"),
-    pollutants: str | None = Query(None, description="items のエイリアス（カンマ区切り）"),
-    datetime_: str = Query(..., alias="datetime", description="対象時刻 ISO 8601"),
+    z: int = Query(..., description=f"ズームレベル（{AVAILABLE_ZOOM_LEVELS[0]}〜{AVAILABLE_ZOOM_LEVELS[-1]}）"),
+    item: str | None = Query(None, description="測定項目（カンマ区切り可）。`items` と同義"),
+    pollutant: str | None = Query(None, description="`item` の後方互換エイリアス"),
+    items: str | None = Query(None, description="測定項目のカンマ区切り（推奨）。例: ox,pm25,no2"),
+    pollutants: str | None = Query(None, description="`items` の後方互換エイリアス"),
+    datetime_: str = Query(..., alias="datetime", description="対象時刻（ISO 8601。正時に丸め）"),
     bbox: str | None = Query(
         None,
-        description="min_lon,min_lat,max_lon,max_lat（省略時は全国）",
+        description="出力範囲 min_lon,min_lat,max_lon,max_lat。省略時は全国",
     ),
-    method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
-    smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+    method: str = Query(
+        DEFAULT_METHOD,
+        description=f"補間メソッド: {', '.join(AVAILABLE_METHODS)}",
+    ),
+    smoothing: float = Query(
+        0.001,
+        description="atps / tps の平滑化強度（0=厳密補間、大きいほど滑らか）",
+    ),
     compute_domain: Literal["auto", "national", "bbox"] = Query(
         "national",
-        description="補間計算領域。national=全国計算（推奨）、auto=自動選択（bbox指定時は部分計算）、bbox=bbox領域のみ直接補間",
+        description="補間計算領域。national=全国計算してキャッシュ（推奨） / auto=自動 / bbox=bbox 内のみ直接補間",
     ),
     station_margin_tiles: int | None = Query(
         None,
         ge=0,
         le=256,
-        description="compute_domain=bbox のとき、観測局選定に使う bbox 拡張タイル数。未指定時は自動",
+        description="compute_domain=bbox 時の観測局選定用 bbox 拡張タイル数（未指定時は自動）",
     ),
     min_station_count: int = Query(
         16,
         ge=1,
         le=10000,
-        description="compute_domain=bbox のときの最小観測局数。未満なら全国局集合へ自動フォールバック",
+        description="compute_domain=bbox 時の最小観測局数。不足時は全国局集合へフォールバック",
     ),
 ):
-    """bbox 内の全タイルの補間値を返す（地図描画用）。bbox 省略時は全国。"""
+    """bbox 内の補間グリッド（2 次元配列）を 1 時刻分返します。地図への色塗り・ヒートマップ描画の主用途です。
+
+    レスポンスの `fields` に項目ごとの 2 次元配列が入ります。
+    計算中の場合は 503（Retry-After: 5）を返すことがあります。
+    """
     if z not in AVAILABLE_ZOOM_LEVELS:
         raise HTTPException(
             status_code=400,
@@ -1327,24 +1350,32 @@ async def grid_field(
     )
 
 
-@router.get("/range")
-@router.get("/field/range")
+@router.get("/range", summary="補間グリッド（複数時刻）")
 async def grid_field_range(
-    z: int = Query(..., description="ズームレベル（12 または 14）"),
-    item: str | None = Query(None, description="測定項目名（カンマ区切り可）"),
-    pollutant: str | None = Query(None, description="item のエイリアス（カンマ区切り可）"),
-    items: str | None = Query(None, description="測定項目名（カンマ区切り）"),
-    pollutants: str | None = Query(None, description="items のエイリアス（カンマ区切り）"),
-    from_datetime: str = Query(..., alias="from", description="開始時刻 ISO 8601（含む）"),
-    to_datetime: str = Query(..., alias="to", description="終了時刻 ISO 8601（含む）"),
+    z: int = Query(..., description=f"ズームレベル（{AVAILABLE_ZOOM_LEVELS[0]}〜{AVAILABLE_ZOOM_LEVELS[-1]}）"),
+    item: str | None = Query(None, description="測定項目（カンマ区切り可）。`items` と同義"),
+    pollutant: str | None = Query(None, description="`item` の後方互換エイリアス"),
+    items: str | None = Query(None, description="測定項目のカンマ区切り（推奨）。例: ox,pm25,no2"),
+    pollutants: str | None = Query(None, description="`items` の後方互換エイリアス"),
+    from_datetime: str = Query(..., alias="from", description="開始時刻（ISO 8601、含む。正時に丸め）"),
+    to_datetime: str = Query(..., alias="to", description="終了時刻（ISO 8601、含む。正時に丸め）"),
     bbox: str = Query(
         ...,
-        description="min_lon,min_lat,max_lon,max_lat（レスポンス縮小のため必須）",
+        description="出力範囲 min_lon,min_lat,max_lon,max_lat（必須。レスポンスサイズ抑制のため）",
     ),
-    method: str = Query(DEFAULT_METHOD, description="補間メソッド: atps / tps / linear"),
-    smoothing: float = Query(0.001, description="atps / tps の平滑化強度。0 で厳密補間、大きいほど滑らか"),
+    method: str = Query(
+        DEFAULT_METHOD,
+        description=f"補間メソッド: {', '.join(AVAILABLE_METHODS)}",
+    ),
+    smoothing: float = Query(
+        0.001,
+        description="atps / tps の平滑化強度（0=厳密補間、大きいほど滑らか）",
+    ),
 ):
-    """bbox 内グリッドを複数時刻まとめて返す。"""
+    """bbox 内の補間グリッドを複数時刻まとめて返します（最大 72 時間）。
+
+    アニメーションや時系列地図向け。完成 JSON は短期キャッシュ（最大 7 日）されます。
+    """
     if z not in AVAILABLE_ZOOM_LEVELS:
         raise HTTPException(
             status_code=400,

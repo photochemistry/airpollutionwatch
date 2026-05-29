@@ -21,7 +21,7 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
 
 - **マスタ系**: `/v1/prefectures`, `/v1/stations`, `/v1/stations/{station_id}`
 - **観測値系**: `/v1/measurements`, `/v1/latest`
-- **メタ / 監視系**: `/v1/coverage`, `/v1/log`（JSON: 県別ステータス + ログ本文）
+- **メタ / 監視系**: `/v1/log`（JSON: 県別ステータス + ログ本文）
 
 `/v1/measurements` のレスポンス形式の詳細は  
 `docs/measurements-response-formats.md` もあわせて参照してください。
@@ -40,9 +40,11 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
   - `target_datetime`: 収集対象とした「正時」（丸められた 1 時間ごとの基準時刻）。
   - `observed_datetime`: 実際の観測値の時刻。  
     データが欠けている場合などに **1 時間フォールバック** が行われることがある。
-- **pollutants / 測定項目**
-  - `pm25, ox, no2, ...` のような名前で指定。  
-  - 実際のカラム名は `PM25`, `OX`, `NO2` などの **そらまめ互換列名** になる。
+- **items / 測定項目**
+  - クエリパラメータ名は **`items`**（例: `pm25,ox,no2`）。
+  - 指定値は `pm25`, `ox`, `no2`, ... のような小文字 ID。
+  - レスポンス内のカラム名は `PM25`, `OX`, `NO2` などの **そらまめ互換列名**。
+  - `format=series` の各系列ではフィールド名 **`item`** に上記列名が入る。
 - **format=series / snapshot（`/v1/measurements`）**
   - `series`: (局, 測定項目) ごとの **時系列配列**。
   - `snapshot`: 1 時刻の **局ごとの一覧（1 局 1 オブジェクト）**。
@@ -78,7 +80,7 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
     - `station_ids`: カンマ区切りの局番号（例: `13114010,13114510`）
     - `pref`: 都道府県 ID（指定するとその県の全局が対象）
     - `from`, `to`: 期間（ISO8601、1 時間単位で解釈）
-    - `pollutants`: `pm25,ox,no2` など
+    - `items`: `pm25,ox,no2` など（既定: `pm25,ox,no2`）
     - `format`: `series`（既定）または `snapshot`
   - **こういうときに使う**:
     - 「特定局の 1 週間の PM2.5 グラフ」
@@ -88,20 +90,18 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
   - `GET /v1/latest`
   - 主なクエリ:
     - `station_ids` または `pref`（どちらか一方）
-    - `pollutants`
+    - `items`: 測定項目のカンマ区切り（例: `pm25,ox`）
   - **こういうときに使う**:
     - 「東京の全局の現在の PM2.5 を一覧表示」
     - 「特定の 1 局の現在値だけ知りたい」
 
 ### 3.3 監視 / メタ情報
 
-- **どこまで履歴が埋まっているか**
-  - `GET /v1/coverage`（HTML）
-- **収集ジョブログ**
-  - `GET /v1/log`（JSON: 県別ステータス `status_items` と `collect_log` 本文）
+- **どこまで履歴が埋まっているか / 収集ジョブログ**
+  - `GET /v1/log`（JSON: 県別ステータス `status_items` と `collect_log` 本文。`status_items` の `oldest_continuous_datetime`・`continuous_days_ago` で連続データ期間も確認可能）
 
 AI エージェントが自動運用を補助する場合、  
-「データがないことによるエラー」かどうか判断するために `/v1/coverage` や `/v1/log` を併用するとよいです。
+「データがないことによるエラー」かどうか判断するために `/v1/log` を併用するとよいです。
 
 ---
 
@@ -114,7 +114,7 @@ AI エージェントが自動運用を補助する場合、
    - `station_ids={station_id}`
    - `from={開始日時}`
    - `to={終了日時}`
-   - `pollutants=pm25`
+   - `items=pm25`
    - `format=series`
 3. レスポンスの `timeseries[0].values` を時系列配列として利用する。
 
@@ -122,7 +122,7 @@ AI エージェントが自動運用を補助する場合、
 
 1. `GET /v1/prefectures` で都道府県 ID の一覧を取得する。
 2. 各都道府県について:
-   - `GET /v1/latest?pref={pref}&pollutants=pm25`
+   - `GET /v1/latest?pref={pref}&items=pm25`
    - `stations` 配列から PM2.5 値を取得し、平均または代表値を計算する。
 3. 計算結果を都道府県ポリゴンにマッピングして可視化する。
 
