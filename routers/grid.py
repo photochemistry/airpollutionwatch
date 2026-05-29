@@ -5,6 +5,7 @@
   GET /v1/grid/info      — メタ情報・キャッシュ状況
   GET /v1/grid/snapshot  — 指定タイル群・1時刻の補間値
   GET /v1/grid/field     — bbox 内全タイルの補間値（後方互換）
+  GET /v1/grid/range     — bbox 内全タイルの補間値（複数時刻・推奨）
   GET /v1/grid/field/range — bbox 内全タイルの補間値（複数時刻）
 """
 
@@ -17,7 +18,7 @@ import logging
 import math
 import sqlite3
 import time
-from typing import Dict, List, Literal
+from typing import Callable, Dict, List, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +289,30 @@ def _fetch_station_snapshot_meta(target_dt_iso: str, item_col: str) -> tuple[int
     return int(row[0] or 0), row[1]
 
 
+def ensure_grid_db_indexes() -> None:
+    """
+    grid キャッシュ妥当性チェックで使う measurements クエリ向けインデックスを作成する。
+    重複作成は IF NOT EXISTS で回避する。
+    """
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_measurements_target_station
+                ON measurements (target_datetime, station_code)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_measurements_station_target
+                ON measurements (station_code, target_datetime)
+                """
+            )
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        logger.warning("grid DB index creation skipped: %s", e)
+
+
 def _get_or_compute_grid(
     datetime_hour: str,
     z: int,
@@ -310,10 +335,22 @@ def _get_or_compute_grid(
         cached_snapshot_at = cached.get("apw_snapshot_at")
         current_count, current_snapshot_at = _fetch_station_snapshot_meta(datetime_hour, item_col)
         if cached_count is not None and current_count != cached_count:
+            logger.info(
+                "grid cache invalidated (station_count changed): %s z=%d method=%s item=%s cached=%s current=%s",
+                datetime_hour, z, method, item, cached_count, current_count,
+            )
             cached = None
         elif cached_snapshot_at != current_snapshot_at:
+            logger.info(
+                "grid cache invalidated (snapshot advanced): %s z=%d method=%s item=%s cached=%s current=%s",
+                datetime_hour, z, method, item, cached_snapshot_at, current_snapshot_at,
+            )
             cached = None
     if cached is not None:
+        logger.info(
+            "grid cache hit: %s z=%d method=%s item=%s",
+            datetime_hour, z, method, item,
+        )
         return cached
 
     if item_col is None:
@@ -486,6 +523,8 @@ def _build_grid_field_response(
             z=z,
             datetime=datetime_hour_iso,
             method=method,
+            items=[item],
+            fields={item: []},
             item=item,
             tile_x_min=out_tx_min,
             tile_x_max=out_tx_max,
@@ -519,6 +558,8 @@ def _build_grid_field_response(
         z=z,
         datetime=datetime_hour_iso,
         method=method,
+        items=[item],
+        fields={item: values_2d},
         item=item,
         tile_x_min=clip_tx_min,
         tile_x_max=clip_tx_max,
@@ -865,6 +906,163 @@ def _parse_body_json(body: bytes) -> dict:
     return json.loads(body.decode("utf-8"))
 
 
+def _build_grid_range_payload(
+    *,
+    dt_from: datetime.datetime,
+    dt_to: datetime.datetime,
+    z: int,
+    method: str,
+    item_list: list[str],
+    bbox: str,
+    compute_body_for_hour: Callable[[str], bytes],
+) -> dict:
+    """
+    grid/range・grid/field 共通で使う時刻レンジ集約処理。
+    compute_body_for_hour は「対象時刻1件ぶんの field JSON body」を返す関数。
+    """
+    total_hours = int((dt_to - dt_from).total_seconds() // 3600) + 1
+    fields_by_datetime: dict[str, dict] = {}
+    timestamps: list[str] = []
+    stacked_values: dict[str, list[list[list[float | None]]]] = {
+        item_name: [] for item_name in item_list
+    }
+    grid_meta: dict | None = None
+    current = dt_from
+    while current <= dt_to:
+        dt_hour_iso = current.isoformat()
+        body = compute_body_for_hour(dt_hour_iso)
+        payload = _parse_body_json(body)
+        fields_by_datetime[dt_hour_iso] = payload
+        timestamps.append(dt_hour_iso)
+
+        if grid_meta is None:
+            gx_min = int(payload["tile_x_min"])
+            gx_max = int(payload["tile_x_max"])
+            gy_min = int(payload["tile_y_min"])
+            gy_max = int(payload["tile_y_max"])
+            grid_meta = {
+                "z": z,
+                "xMin": gx_min,
+                "xMax": gx_max,
+                "yMin": gy_min,
+                "yMax": gy_max,
+                "width": gx_max - gx_min + 1,
+                "height": gy_max - gy_min + 1,
+                # タイル格子の座標系を明示（地理院/OSM互換のWeb Mercator tile grid）
+                "crs": "WebMercatorTile",
+            }
+
+        payload_fields = payload.get("fields") or {}
+        if len(item_list) == 1 and (not payload_fields):
+            single_item = item_list[0]
+            payload_fields = {single_item: payload.get("values", [])}
+        for item_name in item_list:
+            stacked_values[item_name].append(payload_fields.get(item_name, []))
+        current += datetime.timedelta(hours=1)
+
+    return {
+        "grid": grid_meta,
+        "z": z,
+        "from": dt_from.isoformat(),
+        "to": dt_to.isoformat(),
+        "method": method,
+        "items": item_list,
+        "bbox": bbox,
+        "count_hours": total_hours,
+        "timestamps": timestamps,
+        "values": stacked_values,
+        # 互換のため残す（従来実装を参照しているクライアント向け）
+        "series": fields_by_datetime,
+    }
+
+
+def _single_field_payload_from_range_payload(
+    *,
+    range_payload: dict,
+    dt_hour_iso: str,
+) -> dict:
+    """range ペイロード（1時刻）から field 互換ペイロードへ変換する。"""
+    item_list = list(range_payload.get("items") or [])
+    grid_meta = range_payload.get("grid") or {}
+    series = range_payload.get("series") or {}
+    src = series.get(dt_hour_iso) or {}
+    stacked_values = range_payload.get("values") or {}
+
+    fields: dict[str, list[list[float | None]]] = {}
+    for item_name in item_list:
+        item_stack = stacked_values.get(item_name) or []
+        fields[item_name] = item_stack[0] if item_stack else []
+
+    payload = {
+        "grid_generated_at": src.get("grid_generated_at"),
+        "apw_snapshot_at": src.get("apw_snapshot_at"),
+        "apw_oldest_station_at": src.get("apw_oldest_station_at"),
+        "z": int(range_payload.get("z")),
+        "datetime": dt_hour_iso,
+        "method": range_payload.get("method"),
+        "items": item_list,
+        "tile_x_min": int(grid_meta.get("xMin")),
+        "tile_x_max": int(grid_meta.get("xMax")),
+        "tile_y_min": int(grid_meta.get("yMin")),
+        "tile_y_max": int(grid_meta.get("yMax")),
+        "fields": fields,
+    }
+    # field 特有の付帯情報は series 側にあれば引き継ぐ
+    for k in ("compute_domain", "fallback_level", "used_station_count", "auto_selected_margin_tiles"):
+        if k in src:
+            payload[k] = src[k]
+    if len(item_list) == 1:
+        payload["item"] = item_list[0]
+        payload["values"] = fields[item_list[0]]
+    return payload
+
+
+def _ensure_field_response_info(
+    body: bytes,
+    *,
+    status: str,
+    requested_items: list[str],
+    compute_domain: str,
+    bbox: str | None,
+) -> bytes:
+    """
+    grid/field の返却JSONに info 系キーを補完する。
+    既存キャッシュが古い形式でも、items/fields/compute_domain/cache_status を安定提供する。
+    """
+    payload = _parse_body_json(body)
+    changed = False
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        single_item = payload.get("item")
+        payload["items"] = [single_item] if isinstance(single_item, str) else list(requested_items)
+        items = payload["items"]
+        changed = True
+
+    fields = payload.get("fields")
+    if not isinstance(fields, dict):
+        if len(items) == 1 and "values" in payload:
+            payload["fields"] = {items[0]: payload.get("values") or []}
+        else:
+            payload["fields"] = {}
+        changed = True
+
+    if payload.get("compute_domain") is None:
+        if compute_domain == "auto" and bbox is not None:
+            payload["compute_domain"] = "auto-bbox"
+        else:
+            payload["compute_domain"] = compute_domain
+        changed = True
+
+    if payload.get("cache_status") != status:
+        payload["cache_status"] = status
+        changed = True
+
+    if not changed:
+        return body
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 def _parse_iso_datetime_or_400(raw: str, *, field_name: str) -> datetime.datetime:
     """ISO8601 文字列を datetime に変換する（末尾 Z も許容）。"""
     normalized = raw.strip()
@@ -1050,33 +1248,53 @@ async def grid_field(
     ) + f"|domain={compute_domain}|smg={station_margin_tiles}|msc={min_station_count}"
 
     def _compute() -> bytes:
-        if compute_domain == "auto" and bbox is not None:
-            return _compute_grid_field_body_auto_bbox(
-                dt_hour_iso=dt_hour_iso,
-                z=z,
-                method=method,
-                items=item_list,
-                bbox=bbox,
-                smoothing=smoothing,
-                min_station_count=min_station_count,
-            )
-        if compute_domain == "bbox":
-            resolved_margin = (
-                station_margin_tiles if station_margin_tiles is not None else 8
-            )
-            return _compute_grid_field_body_local_bbox(
-                dt_hour_iso,
-                z,
-                method,
-                item_list,
-                bbox,
-                smoothing,
-                resolved_margin,
-                min_station_count,
-            )
-        return _compute_grid_field_body(
-            dt_hour_iso, z, method, item_list, bbox, smoothing
+        resolved_bbox = bbox or (
+            f"{JAPAN_BBOX.min_lon},{JAPAN_BBOX.min_lat},{JAPAN_BBOX.max_lon},{JAPAN_BBOX.max_lat}"
         )
+
+        def _compute_one_hour(hour_iso: str) -> bytes:
+            if compute_domain == "auto" and bbox is not None:
+                return _compute_grid_field_body_auto_bbox(
+                    dt_hour_iso=hour_iso,
+                    z=z,
+                    method=method,
+                    items=item_list,
+                    bbox=bbox,
+                    smoothing=smoothing,
+                    min_station_count=min_station_count,
+                )
+            if compute_domain == "bbox":
+                resolved_margin = (
+                    station_margin_tiles if station_margin_tiles is not None else 8
+                )
+                return _compute_grid_field_body_local_bbox(
+                    hour_iso,
+                    z,
+                    method,
+                    item_list,
+                    bbox,
+                    smoothing,
+                    resolved_margin,
+                    min_station_count,
+                )
+            return _compute_grid_field_body(
+                hour_iso, z, method, item_list, bbox, smoothing
+            )
+
+        range_payload = _build_grid_range_payload(
+            dt_from=dt_hour,
+            dt_to=dt_hour,
+            z=z,
+            method=method,
+            item_list=item_list,
+            bbox=resolved_bbox,
+            compute_body_for_hour=_compute_one_hour,
+        )
+        field_payload = _single_field_payload_from_range_payload(
+            range_payload=range_payload,
+            dt_hour_iso=dt_hour_iso,
+        )
+        return json.dumps(field_payload, ensure_ascii=False).encode("utf-8")
 
     def _data_version() -> str:
         return _field_data_version(dt_hour_iso, item_list)
@@ -1089,6 +1307,13 @@ async def grid_field(
         )
     )
     if body is not None:
+        body = _ensure_field_response_info(
+            body,
+            status=status,
+            requested_items=item_list,
+            compute_domain=compute_domain,
+            bbox=bbox,
+        )
         return Response(content=body, media_type="application/json")
     if status == "pending":
         raise HTTPException(
@@ -1102,6 +1327,7 @@ async def grid_field(
     )
 
 
+@router.get("/range")
 @router.get("/field/range")
 async def grid_field_range(
     z: int = Query(..., description="ズームレベル（12 または 14）"),
@@ -1149,68 +1375,24 @@ async def grid_field_range(
             detail="取得期間が長すぎます。最大72時間までにしてください",
         )
 
-    fields_by_datetime: dict[str, dict] = {}
-    timestamps: list[str] = []
-    stacked_values: dict[str, list[list[list[float | None]]]] = {
-        item_name: [] for item_name in item_list
-    }
-    grid_meta: dict | None = None
-    current = dt_from
-    while current <= dt_to:
-        dt_hour_iso = current.isoformat()
-        body = await asyncio.to_thread(
-            lambda: _compute_grid_field_body(
+    response = await asyncio.to_thread(
+        lambda: _build_grid_range_payload(
+            dt_from=dt_from,
+            dt_to=dt_to,
+            z=z,
+            method=method,
+            item_list=item_list,
+            bbox=bbox,
+            compute_body_for_hour=lambda dt_hour_iso: _compute_grid_field_body(
                 dt_hour_iso,
                 z,
                 method,
                 item_list,
                 bbox,
                 smoothing,
-            )
+            ),
         )
-        payload = _parse_body_json(body)
-        fields_by_datetime[dt_hour_iso] = payload
-        timestamps.append(dt_hour_iso)
-
-        if grid_meta is None:
-            gx_min = int(payload["tile_x_min"])
-            gx_max = int(payload["tile_x_max"])
-            gy_min = int(payload["tile_y_min"])
-            gy_max = int(payload["tile_y_max"])
-            grid_meta = {
-                "z": z,
-                "xMin": gx_min,
-                "xMax": gx_max,
-                "yMin": gy_min,
-                "yMax": gy_max,
-                "width": gx_max - gx_min + 1,
-                "height": gy_max - gy_min + 1,
-                # タイル格子の座標系を明示（地理院/OSM互換のWeb Mercator tile grid）
-                "crs": "WebMercatorTile",
-            }
-
-        payload_fields = payload.get("fields") or {}
-        if len(item_list) == 1 and (not payload_fields):
-            single_item = item_list[0]
-            payload_fields = {single_item: payload.get("values", [])}
-        for item_name in item_list:
-            stacked_values[item_name].append(payload_fields.get(item_name, []))
-        current += datetime.timedelta(hours=1)
-
-    response = {
-        "grid": grid_meta,
-        "z": z,
-        "from": dt_from.isoformat(),
-        "to": dt_to.isoformat(),
-        "method": method,
-        "items": item_list,
-        "bbox": bbox,
-        "count_hours": total_hours,
-        "timestamps": timestamps,
-        "values": stacked_values,
-        # 互換のため残す（従来実装を参照しているクライアント向け）
-        "series": fields_by_datetime,
-    }
+    )
     return Response(
         content=json.dumps(response, ensure_ascii=False),
         media_type="application/json",

@@ -19,6 +19,7 @@ import logging
 from routers.v1 import router as v1_router
 from routers.grid import router as v1_grid_router
 from routers.amedas import router as v1_amedas_router
+from routers.grid import ensure_grid_db_indexes
 
 ROOT = Path(__file__).resolve().parent
 DASHBOARD_DIST = ROOT / "dashboard" / "dist"
@@ -54,6 +55,7 @@ airpollutionwatch は、日本全国の都道府県が公開している大気�
   - 複数項目はカンマ区切りで指定可能（例: `items=ox,pm25,no2`）
   - レスポンスは `items` と `fields`（項目ごとの2次元配列）を返却
   - 既定は `compute_domain=national`（全国計算キャッシュを優先）
+- `GET /v1/grid/range` — bbox 内の複数時刻をまとめて返す（from/to,bbox 必須、`/field/range` の短縮エイリアス）
 - `GET /v1/grid/field/range` — bbox 内の複数時刻をまとめて返す（from/to,bbox 必須）
   - 完成 JSON は grid_response_cache.sqlite3 に最大7日保持
 
@@ -167,6 +169,7 @@ def _patch_uvicorn_invalid_request_logging() -> None:
 @app.on_event("startup")
 async def _setup_logging() -> None:
     """uvicorn の logging 設定完了後に各モジュールのロガーを接続する."""
+    ensure_grid_db_indexes()
     uvicorn_handlers = logging.getLogger("uvicorn").handlers
     for name in ("routers.grid", "routers.amedas", "data.amedas"):
         lg = logging.getLogger(name)
