@@ -23,6 +23,7 @@ from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict
 
+import airpollutionwatch
 from airpollutionwatch import prefecture_retrievers, ITEMSPECS
 from data.stations import get_stations_df, PREF_NAME_TO_ID
 
@@ -54,9 +55,25 @@ DB_PATH = ROOT / "airpollutionwatch.sqlite3"
 GEOJSON_OUTLINES_DIR = ROOT / "geojson_outlines"
 COLLECT_LOG_PATH = ROOT / "collect.log"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
-PREF_LINKS_PATH = ROOT / "airpollutionwatch" / "pref-links.md"
+
+# status_items / has_data に載せる追加県（prefecture_retrievers へ未反映の環境向け）
+_COLLECTION_STATUS_EXTRA_PREF_IDS = frozenset({"wakayama"})
 
 router = APIRouter(prefix="/v1", tags=["v1"])
+
+
+def _pref_links_path() -> Path:
+    """pref-links.md のパス（airpollutionwatch パッケージ直下を優先）。"""
+    pkg_root = Path(airpollutionwatch.__file__).resolve().parent.parent
+    candidate = pkg_root / "pref-links.md"
+    if candidate.is_file():
+        return candidate
+    return ROOT / "airpollutionwatch" / "pref-links.md"
+
+
+def collection_prefecture_ids() -> list[str]:
+    """収集状況（status_items）・has_data 判定に使う都道府県 ID 一覧。"""
+    return sorted(set(prefecture_retrievers.keys()) | _COLLECTION_STATUS_EXTRA_PREF_IDS)
 
 # --- モデル ---
 class StationListItem(BaseModel):
@@ -232,7 +249,7 @@ async def geojson_outline(pref_id: str):
 @router.get("/prefectures", response_model=List[PrefectureInfo])
 async def prefectures():
     """都道府県一覧を返す。全 47 都道府県について、ID・日本語名・データ取得可否・地域ブロック。"""
-    has_data_set = set(prefecture_retrievers.keys())
+    has_data_set = set(collection_prefecture_ids())
     items = []
     for pref_id in PREF_ID_TO_NAME:
         items.append(
@@ -499,7 +516,7 @@ async def coverage():
 
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        for pref in sorted(prefecture_retrievers.keys()):
+        for pref in collection_prefecture_ids():
             cur.execute("SELECT DISTINCT target_datetime FROM measurements WHERE prefecture = ?", (pref,))
             result = [r[0] for r in cur.fetchall()]
             if not result:
@@ -603,7 +620,7 @@ class PrefLogHistoryResponse(BaseModel):
 
 def _load_pref_links() -> Dict[str, str]:
     """pref-links.md をパースし、県 ID → URL の辞書を返す。1行目はヘッダ、2行目以降は「県ID URL ...」形式。"""
-    path = PREF_LINKS_PATH.resolve()
+    path = _pref_links_path().resolve()
     if not path.exists():
         return {}
     try:
@@ -723,7 +740,7 @@ def _get_collection_status_items() -> List[CollectionStatusItem]:
 
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        for pref in sorted(prefecture_retrievers.keys()):
+        for pref in collection_prefecture_ids():
             cur.execute(
                 "SELECT MAX(target_datetime) AS latest FROM measurements WHERE prefecture = ?",
                 (pref,),
