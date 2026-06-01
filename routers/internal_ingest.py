@@ -6,22 +6,53 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
+import runpy
 from typing import Literal
 
+import httpx
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from config import connect_db
+from config import ROOT, connect_db
 from grid.cache import evict_cache_by_datetime_hour
 from grid.response_cache import evict_response_cache_by_data_version
 
 router = APIRouter(prefix="/internal/ingest", tags=["internal"])
+logger = logging.getLogger(__name__)
 
 JST = datetime.timezone(datetime.timedelta(hours=9))
 INGEST_TOKEN_ENV = "AIRPOLLUTIONWATCH_INGEST_TOKEN"
 INGEST_TOKEN_FILE_ENV = "AIRPOLLUTIONWATCH_INGEST_TOKEN_FILE"
+ALERT_FAILURE_HOURS_ENV = "ALERT_FAILURE_HOURS"
+ALERT_DISCORD_WEBHOOK_ENV = "ALERT_DISCORD_WEBHOOK_URL"
+DISCORD_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"
 
+
+def _load_auth_info() -> dict[str, object]:
+    """任意の auth_info.py を読み込む（存在しなければ空）。"""
+    path = ROOT / "auth_info.py"
+    if not path.is_file():
+        return {}
+    try:
+        data = runpy.run_path(str(path))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("auth_info.py の読み込みに失敗: %s", e)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+AUTH_INFO = _load_auth_info()
+
+
+def _auth_value(name: str) -> str:
+    raw = AUTH_INFO.get(name)
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    return str(raw).strip()
 
 class MeasurementRow(BaseModel):
     station_code: int = Field(..., description="国環研局番（8桁整数）")
@@ -63,7 +94,11 @@ class IngestResponse(BaseModel):
 def _require_ingest_token(authorization: str | None) -> None:
     expected = os.environ.get(INGEST_TOKEN_ENV, "").strip()
     if not expected:
+        expected = _auth_value(INGEST_TOKEN_ENV)
+    if not expected:
         token_file = os.environ.get(INGEST_TOKEN_FILE_ENV, "").strip()
+        if not token_file:
+            token_file = _auth_value(INGEST_TOKEN_FILE_ENV)
         if token_file:
             try:
                 expected = open(token_file, encoding="utf-8").read().strip()
@@ -128,6 +163,16 @@ def _ensure_tables(conn) -> None:
             status TEXT NOT NULL,
             error_message TEXT,
             attempted_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingest_alert_sent (
+            prefecture TEXT NOT NULL,
+            target_datetime TEXT NOT NULL,
+            alerted_at TEXT NOT NULL,
+            PRIMARY KEY (prefecture, target_datetime)
         )
         """
     )
@@ -209,6 +254,160 @@ def _record_attempt(conn, req: IngestRequest, attempted_at_iso: str) -> None:
     conn.commit()
 
 
+def _alert_failure_hours() -> int:
+    raw = os.environ.get(ALERT_FAILURE_HOURS_ENV, "").strip()
+    if not raw:
+        raw = _auth_value(ALERT_FAILURE_HOURS_ENV)
+    if not raw:
+        raw = "3"
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(value, 1)
+
+
+def _discord_webhook_url() -> str:
+    env_alert = os.environ.get(ALERT_DISCORD_WEBHOOK_ENV, "").strip()
+    env_legacy = os.environ.get(DISCORD_WEBHOOK_ENV, "").strip()
+    if env_alert or env_legacy:
+        return env_alert or env_legacy
+    auth_alert = _auth_value(ALERT_DISCORD_WEBHOOK_ENV)
+    auth_legacy = _auth_value(DISCORD_WEBHOOK_ENV)
+    return auth_alert or auth_legacy
+
+
+def _send_discord_alert(
+    *,
+    prefecture: str,
+    target_iso: str,
+    since_iso: str,
+    error: str,
+    failure_hours: int,
+) -> None:
+    webhook = _discord_webhook_url()
+    if not webhook:
+        return
+
+    text = (
+        "【ALERT】airpollutionwatch 収集失敗が継続しています\n"
+        f"- 都道府県: {prefecture}\n"
+        f"- 対象時刻: {target_iso}\n"
+        f"- 初回失敗: {since_iso}\n"
+        f"- 継続時間: {failure_hours}時間以上\n"
+        f"- 代表エラー: {error}"
+    )
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.post(webhook, json={"content": text})
+        resp.raise_for_status()
+
+
+def _maybe_notify_failure(
+    conn,
+    *,
+    prefecture: str,
+    target_iso: str,
+    status: str,
+    error_message: str | None,
+    attempted_at_iso: str,
+) -> None:
+    cur = conn.cursor()
+
+    if status == "ok":
+        cur.execute(
+            """
+            DELETE FROM ingest_alert_sent
+            WHERE prefecture = ? AND target_datetime = ?
+            """,
+            (prefecture, target_iso),
+        )
+        conn.commit()
+        return
+
+    if status != "failed":
+        return
+
+    cur.execute(
+        """
+        SELECT 1 FROM ingest_alert_sent
+        WHERE prefecture = ? AND target_datetime = ?
+        """,
+        (prefecture, target_iso),
+    )
+    if cur.fetchone() is not None:
+        return
+
+    cur.execute(
+        """
+        SELECT MAX(attempted_at) FROM ingest_attempts
+        WHERE prefecture = ? AND target_datetime = ? AND status = 'ok'
+        """,
+        (prefecture, target_iso),
+    )
+    last_ok_row = cur.fetchone()
+    last_ok_at = last_ok_row[0] if last_ok_row else None
+
+    if last_ok_at:
+        cur.execute(
+            """
+            SELECT attempted_at, error_message
+            FROM ingest_attempts
+            WHERE prefecture = ? AND target_datetime = ? AND status = 'failed'
+              AND attempted_at > ?
+            ORDER BY attempted_at ASC
+            LIMIT 1
+            """,
+            (prefecture, target_iso, last_ok_at),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT attempted_at, error_message
+            FROM ingest_attempts
+            WHERE prefecture = ? AND target_datetime = ? AND status = 'failed'
+            ORDER BY attempted_at ASC
+            LIMIT 1
+            """,
+            (prefecture, target_iso),
+        )
+    row = cur.fetchone()
+    if row is None:
+        return
+
+    first_failed_at_str, first_error = row
+    failure_hours = _alert_failure_hours()
+    now_dt = datetime.datetime.fromisoformat(attempted_at_iso)
+    first_failed_dt = datetime.datetime.fromisoformat(first_failed_at_str)
+    if now_dt - first_failed_dt < datetime.timedelta(hours=failure_hours):
+        return
+
+    try:
+        _send_discord_alert(
+            prefecture=prefecture,
+            target_iso=target_iso,
+            since_iso=first_failed_at_str,
+            error=first_error or error_message or "",
+            failure_hours=failure_hours,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "failed to send discord alert: pref=%s target=%s err=%s",
+            prefecture,
+            target_iso,
+            e,
+        )
+        return
+
+    cur.execute(
+        """
+        INSERT INTO ingest_alert_sent (prefecture, target_datetime, alerted_at)
+        VALUES (?, ?, ?)
+        """,
+        (prefecture, target_iso, attempted_at_iso),
+    )
+    conn.commit()
+
+
 def _evict_caches(target_datetime: str) -> tuple[int, int]:
     evicted_grid = evict_cache_by_datetime_hour(target_datetime)
     evicted_response = evict_response_cache_by_data_version(target_datetime)
@@ -235,6 +434,14 @@ async def ingest_measurements(
         _ensure_tables(conn)
         inserted_rows = _insert_measurements(conn, req, now_iso)
         _record_attempt(conn, req, attempted_at_iso)
+        _maybe_notify_failure(
+            conn,
+            prefecture=req.prefecture,
+            target_iso=req.target_datetime,
+            status=req.status,
+            error_message=req.error_message,
+            attempted_at_iso=attempted_at_iso,
+        )
 
     evicted_grid = 0
     evicted_response = 0

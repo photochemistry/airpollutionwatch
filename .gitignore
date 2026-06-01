@@ -16,3 +16,4 @@ dashboard/dist
 grid_response_cache.sqlite3-shm
 grid_response_cache.sqlite3-wal
 airpollutionwatch.sqlite3-journal
+auth_info.py
