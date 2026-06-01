@@ -20,6 +20,7 @@ router = APIRouter(prefix="/internal/ingest", tags=["internal"])
 
 JST = datetime.timezone(datetime.timedelta(hours=9))
 INGEST_TOKEN_ENV = "AIRPOLLUTIONWATCH_INGEST_TOKEN"
+INGEST_TOKEN_FILE_ENV = "AIRPOLLUTIONWATCH_INGEST_TOKEN_FILE"
 
 
 class MeasurementRow(BaseModel):
@@ -62,9 +63,19 @@ class IngestResponse(BaseModel):
 def _require_ingest_token(authorization: str | None) -> None:
     expected = os.environ.get(INGEST_TOKEN_ENV, "").strip()
     if not expected:
+        token_file = os.environ.get(INGEST_TOKEN_FILE_ENV, "").strip()
+        if token_file:
+            try:
+                expected = open(token_file, encoding="utf-8").read().strip()
+            except OSError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"{INGEST_TOKEN_FILE_ENV} の読み取りに失敗しました: {e}",
+                )
+    if not expected:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"{INGEST_TOKEN_ENV} が未設定です",
+            detail=f"{INGEST_TOKEN_ENV} または {INGEST_TOKEN_FILE_ENV} が未設定です",
         )
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(

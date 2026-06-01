@@ -54,6 +54,7 @@ poetry run python api.py
 |------|------|
 | `AIRPOLLUTIONWATCH_DB_PATH` | 測定データ SQLite のパス。省略時は本リポジトリ直下の `airpollutionwatch.sqlite3` |
 | `AIRPOLLUTIONWATCH_INGEST_TOKEN` | 内部 ingest API（`POST /internal/ingest/measurements`）の Bearer トークン |
+| `AIRPOLLUTIONWATCH_INGEST_TOKEN_FILE` | 内部 ingest API で使うトークンファイルのパス（本文を token として利用） |
 
 `collect_hourly.py`（crawler）と **同じパス** を指定してください。接続時に SQLite WAL モードを有効化します。
 
