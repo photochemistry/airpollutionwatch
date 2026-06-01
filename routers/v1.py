@@ -62,12 +62,23 @@ router = APIRouter(prefix="/v1", tags=["v1"])
 
 
 def _pref_links_path() -> Path:
-    """pref-links.md のパス（airpollutionwatch パッケージ直下を優先）。"""
-    pkg_root = Path(airpollutionwatch.__file__).resolve().parent.parent
-    candidate = pkg_root / "pref-links.md"
-    if candidate.is_file():
-        return candidate
-    return ROOT / "airpollutionwatch" / "pref-links.md"
+    """pref-links.md のパスを探索して返す（見つからない場合は API 直下）。"""
+    candidates: list[Path] = []
+    try:
+        pkg_root = Path(airpollutionwatch.__file__).resolve().parent.parent
+        candidates.append(pkg_root / "pref-links.md")
+    except Exception:
+        # 実行環境によっては airpollutionwatch が import できないことがある
+        pass
+    candidates.extend([
+        ROOT / "pref-links.md",
+        ROOT / "airpollutionwatch" / "pref-links.md",
+        ROOT.parent / "airpollutionwatch" / "pref-links.md",
+    ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return ROOT / "pref-links.md"
 
 
 def collection_prefecture_ids() -> list[str]:
