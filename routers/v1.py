@@ -55,9 +55,6 @@ GEOJSON_OUTLINES_DIR = ROOT / "geojson_outlines"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
 INGEST_LOG_LIMIT = 500
 
-# status_items / has_data に載せる追加県（prefecture_retrievers へ未反映の環境向け）
-_COLLECTION_STATUS_EXTRA_PREF_IDS = frozenset({"wakayama"})
-
 router = APIRouter(prefix="/v1", tags=["v1"])
 
 
@@ -82,8 +79,39 @@ def _pref_links_path() -> Path:
 
 
 def collection_prefecture_ids() -> list[str]:
-    """収集状況（status_items）・has_data 判定に使う都道府県 ID 一覧。"""
-    return sorted(set(prefecture_retrievers.keys()) | _COLLECTION_STATUS_EXTRA_PREF_IDS)
+    """収集状況・has_data 判定に使う都道府県 ID 一覧。"""
+    return sorted(prefecture_retrievers.keys())
+
+
+def log_overview_prefecture_ids() -> list[str]:
+    """巡回ログ画面用: 全47都道府県（公式サイトリンク表示のため）。"""
+    return sorted(PREF_ID_TO_NAME.keys())
+
+
+def _ensure_measurements_log_indexes(cur: sqlite3.Cursor) -> None:
+    """/v1/log 用: 県×時刻の集計を速くするインデックス。"""
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_measurements_pref_target
+        ON measurements (prefecture, target_datetime)
+        """
+    )
+
+
+def _ensure_ingest_attempts_log_indexes(cur: sqlite3.Cursor) -> None:
+    """/v1/log 用: ingest_attempts の最新行・ログ取得を速くするインデックス。"""
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ingest_pref_attempted
+        ON ingest_attempts (prefecture, attempted_at DESC)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ingest_attempted
+        ON ingest_attempts (attempted_at DESC)
+        """
+    )
 
 # --- モデル ---
 class StationListItem(BaseModel):
@@ -677,23 +705,25 @@ def _ingest_status_per_prefecture(cur: sqlite3.Cursor) -> Dict[str, tuple[str, s
     """ingest_attempts の最新行から県ごとの log_status / log_message を返す。"""
     if not _ingest_attempts_table_exists(cur):
         return {}
-    result: Dict[str, tuple[str, str | None]] = {}
-    for pref in collection_prefecture_ids():
-        cur.execute(
-            """
-            SELECT status, error_message
+    result: Dict[str, tuple[str, str | None]] = {
+        pref: ("ok", None) for pref in log_overview_prefecture_ids()
+    }
+    cur.execute(
+        """
+        SELECT ia.prefecture, ia.status, ia.error_message
+        FROM ingest_attempts AS ia
+        INNER JOIN (
+            SELECT prefecture, MAX(attempted_at) AS max_at
             FROM ingest_attempts
-            WHERE prefecture = ?
-            ORDER BY attempted_at DESC
-            LIMIT 1
-            """,
-            (pref,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            result[pref] = ("ok", None)
-        else:
-            result[pref] = _ingest_status_from_row(row[0], row[1])
+            GROUP BY prefecture
+        ) AS latest
+            ON ia.prefecture = latest.prefecture
+           AND ia.attempted_at = latest.max_at
+        """
+    )
+    for pref, status, error_message in cur.fetchall():
+        if pref in result:
+            result[pref] = _ingest_status_from_row(status, error_message)
     return result
 
 
@@ -753,18 +783,8 @@ def _parse_db_datetime_utc(iso_str: str) -> datetime.datetime | None:
         return None
 
 
-def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | None, float | None]:
-    """県の target_datetime 一覧から、最新から1時間刻みで連続している区間の最古を求め、その ISO 文字列と「何日前か」を返す。"""
-    cur.execute("SELECT DISTINCT target_datetime FROM measurements WHERE prefecture = ?", (pref,))
-    result = [r[0] for r in cur.fetchall()]
-    if not result:
-        return None, None
-    # ナイーブな場合は JST とみなし、UTC に統一して比較
-    dts_utc: list[datetime.datetime] = []
-    for s in result:
-        dt = _parse_db_datetime_utc(s)
-        if dt is not None:
-            dts_utc.append(dt)
+def _oldest_continuous_from_datetimes(dts_utc: list[datetime.datetime]) -> tuple[str | None, float | None]:
+    """正時 datetime の集合から、最新から1時間刻みで連続している区間の最古を求める。"""
     if not dts_utc:
         return None, None
     dt_set = set(dts_utc)
@@ -777,9 +797,47 @@ def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | Non
         cur_dt -= one_hour
     now = datetime.datetime.now(UTC)
     delta_days = (now - oldest).total_seconds() / 86400.0
-    # 返す ISO は JST 表記で（表示用にそのまま DB の解釈を返すと分かりやすい）
     oldest_jst = oldest.astimezone(JST)
     return oldest_jst.isoformat(), round(delta_days, 1)
+
+
+def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | None, float | None]:
+    """県の target_datetime 一覧から、最新から1時間刻みで連続している区間の最古を求め、その ISO 文字列と「何日前か」を返す。"""
+    cur.execute("SELECT DISTINCT target_datetime FROM measurements WHERE prefecture = ?", (pref,))
+    dts_utc: list[datetime.datetime] = []
+    for row in cur.fetchall():
+        dt = _parse_db_datetime_utc(row[0])
+        if dt is not None:
+            dts_utc.append(dt.replace(minute=0, second=0, microsecond=0))
+    return _oldest_continuous_from_datetimes(dts_utc)
+
+
+def _latest_by_prefecture(cur: sqlite3.Cursor) -> Dict[str, str]:
+    """県ごとの最新 target_datetime を一括取得する。"""
+    cur.execute(
+        "SELECT prefecture, MAX(target_datetime) FROM measurements GROUP BY prefecture"
+    )
+    return {row[0]: row[1] for row in cur.fetchall() if row[0] and row[1]}
+
+
+def _datetimes_by_prefecture(cur: sqlite3.Cursor) -> Dict[str, list[datetime.datetime]]:
+    """県ごとの distinct target_datetime（正時 UTC）を一括取得する。"""
+    cur.execute(
+        """
+        SELECT prefecture, target_datetime
+        FROM measurements
+        GROUP BY prefecture, target_datetime
+        """
+    )
+    out: Dict[str, list[datetime.datetime]] = {}
+    for pref, iso in cur.fetchall():
+        if not pref:
+            continue
+        dt = _parse_db_datetime_utc(iso)
+        if dt is None:
+            continue
+        out.setdefault(pref, []).append(dt.replace(minute=0, second=0, microsecond=0))
+    return out
 
 
 def _parse_end_hour_utc(end_iso: str | None) -> datetime.datetime:
@@ -803,52 +861,61 @@ def _parse_end_hour_utc(end_iso: str | None) -> datetime.datetime:
     return dt.replace(minute=0, second=0, microsecond=0)
 
 
-def _get_collection_status_items() -> List[CollectionStatusItem]:
-    """各県の収集巡回状況を一覧で返す。ingest_attempts があれば県ごとの log_status / log_message も付与する。"""
+def _get_collection_status_items_from_cursor(
+    cur: sqlite3.Cursor,
+) -> List[CollectionStatusItem]:
+    """connect_db 済みのカーソルから県別収集状況を組み立てる。"""
     now = datetime.datetime.now(UTC)
     pref_links = _load_pref_links()
     result: List[CollectionStatusItem] = []
 
-    with connect_db() as conn:
-        cur = conn.cursor()
-        log_status_map = _ingest_status_per_prefecture(cur)
-        for pref in collection_prefecture_ids():
-            cur.execute(
-                "SELECT MAX(target_datetime) AS latest FROM measurements WHERE prefecture = ?",
-                (pref,),
+    log_status_map = _ingest_status_per_prefecture(cur)
+    latest_map = _latest_by_prefecture(cur)
+    datetimes_map = _datetimes_by_prefecture(cur)
+    for pref in log_overview_prefecture_ids():
+        latest_iso = latest_map.get(pref)
+        has_data = latest_iso is not None
+
+        hours_ago: float | None = None
+        if latest_iso:
+            latest_dt = _parse_db_datetime_utc(latest_iso)
+            if latest_dt is not None:
+                delta = now - latest_dt
+                hours_ago = round(delta.total_seconds() / 3600.0, 1)
+
+        oldest_iso, continuous_days_ago = _oldest_continuous_from_datetimes(
+            datetimes_map.get(pref, [])
+        )
+
+        level, message = log_status_map.get(pref, ("ok", None))
+
+        result.append(
+            CollectionStatusItem(
+                pref_id=pref,
+                name_ja=PREF_ID_TO_NAME.get(pref, pref),
+                region=PREF_ID_TO_REGION.get(pref, ""),
+                latest_datetime=latest_iso,
+                hours_ago=hours_ago,
+                oldest_continuous_datetime=oldest_iso,
+                continuous_days_ago=continuous_days_ago,
+                has_data=has_data,
+                log_status=level,
+                log_message=message,
+                pref_url=pref_links.get(pref),
             )
-            row = cur.fetchone()
-            latest_iso = row[0] if row and row[0] else None
-            has_data = latest_iso is not None
-
-            hours_ago: float | None = None
-            if latest_iso:
-                latest_dt = _parse_db_datetime_utc(latest_iso)
-                if latest_dt is not None:
-                    delta = now - latest_dt
-                    hours_ago = round(delta.total_seconds() / 3600.0, 1)
-
-            oldest_iso, continuous_days_ago = _oldest_continuous_target(cur, pref)
-
-            level, message = log_status_map.get(pref, ("ok", None))
-
-            result.append(
-                CollectionStatusItem(
-                    pref_id=pref,
-                    name_ja=PREF_ID_TO_NAME.get(pref, pref),
-                    region=PREF_ID_TO_REGION.get(pref, ""),
-                    latest_datetime=latest_iso,
-                    hours_ago=hours_ago,
-                    oldest_continuous_datetime=oldest_iso,
-                    continuous_days_ago=continuous_days_ago,
-                    has_data=has_data,
-                    log_status=level,
-                    log_message=message,
-                    pref_url=pref_links.get(pref),
-                )
-            )
+        )
 
     return result
+
+
+def _get_collection_status_items() -> List[CollectionStatusItem]:
+    """各県の収集巡回状況を一覧で返す。ingest_attempts があれば県ごとの log_status / log_message も付与する。"""
+    with connect_db() as conn:
+        cur = conn.cursor()
+        _ensure_measurements_log_indexes(cur)
+        _ensure_ingest_attempts_log_indexes(cur)
+        conn.commit()
+        return _get_collection_status_items_from_cursor(cur)
 
 
 @router.get("/log", response_model=LogOverviewResponse, summary="収集ログ概要")
@@ -860,13 +927,17 @@ async def collect_log_overview():
 
     データ欠損の原因調査や運用監視に使用します。
     """
-    status_items = _get_collection_status_items()
-
     collect_text: str | None = None
     try:
         with connect_db() as conn:
-            collect_text = _build_ingest_log_text(conn.cursor())
+            cur = conn.cursor()
+            _ensure_measurements_log_indexes(cur)
+            _ensure_ingest_attempts_log_indexes(cur)
+            conn.commit()
+            status_items = _get_collection_status_items_from_cursor(cur)
+            collect_text = _build_ingest_log_text(cur)
     except sqlite3.Error:
+        status_items = _get_collection_status_items()
         collect_text = None
 
     return LogOverviewResponse(status_items=status_items, collect_log=collect_text)
