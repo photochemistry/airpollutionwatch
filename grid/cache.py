@@ -167,6 +167,17 @@ def evict_old_cache() -> int:
         return cur.rowcount
 
 
+def evict_cache_by_datetime_hour(datetime_hour: str) -> int:
+    """指定時刻のエントリを削除し、削除件数を返す。"""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM grid_cache WHERE datetime_hour = ?",
+            (datetime_hour,),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
 def get_latest_info() -> tuple[str | None, str | None]:
     """最新エントリの (generated_at, apw_snapshot_at) を返す。なければ (None, None)。"""
     with _get_conn() as conn:

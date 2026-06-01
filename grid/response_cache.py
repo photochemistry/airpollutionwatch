@@ -97,3 +97,14 @@ def evict_old_response_cache() -> int:
         )
         conn.commit()
         return cur.rowcount
+
+
+def evict_response_cache_by_data_version(data_version: str) -> int:
+    """指定 data_version に一致するエントリを削除し、削除件数を返す。"""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM grid_response_cache WHERE data_version = ?",
+            (data_version,),
+        )
+        conn.commit()
+        return cur.rowcount

@@ -48,6 +48,20 @@ poetry run python api.py
 デフォルトでは `http://0.0.0.0:8089` で待ち受けます。  
 ブラウザで `http://localhost:8089/docs` にアクセスすると、Swagger UI が利用できます。
 
+### 環境変数
+
+| 変数 | 説明 |
+|------|------|
+| `AIRPOLLUTIONWATCH_DB_PATH` | 測定データ SQLite のパス。省略時は本リポジトリ直下の `airpollutionwatch.sqlite3` |
+| `AIRPOLLUTIONWATCH_INGEST_TOKEN` | 内部 ingest API（`POST /internal/ingest/measurements`）の Bearer トークン |
+
+`collect_hourly.py`（crawler）と **同じパス** を指定してください。接続時に SQLite WAL モードを有効化します。
+
+```bash
+export AIRPOLLUTIONWATCH_DB_PATH=/var/lib/airpollutionwatch/airpollutionwatch.sqlite3
+poetry run python api.py
+```
+
 ### 3. ダッシュボードを同一ポートで配信する場合（オプション）
 
 神奈川県 OX 監視用の Svelte ダッシュボードを、API と同じ 8089 番ポートで配信できます。
@@ -128,7 +142,7 @@ curl "https://andersan.net:8089/v1/measurements?pref=tokyo&from=2024-09-03T06:00
 - **説明**: 収集ジョブログの概要を **JSON** で返します。
   - フィールド:
     - `status_items`: 県ごとの収集巡回状況（直近 target_datetime・経過時間・ok/warning/error 等の `CollectionStatusItem` 配列）
-    - `collect_log`: `collect.log` の全文（存在しない・読み取り失敗時は `null`）
+    - `collect_log`: `ingest_attempts` から生成した収集ログテキスト（後方互換のフィールド名。データなしは `null`）
 - **用途**:
   - 収集ジョブの成否確認や、どの県でエラーが出ているかの確認。ダッシュボードから県別ステータスとログ本文をまとめて取得する場合。
 

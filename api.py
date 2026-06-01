@@ -18,6 +18,7 @@ import logging
 from routers.v1 import router as v1_router
 from routers.grid import router as v1_grid_router
 from routers.amedas import router as v1_amedas_router
+from routers.internal_ingest import router as internal_ingest_router
 from routers.grid import ensure_grid_db_indexes
 
 ROOT = Path(__file__).resolve().parent
@@ -48,7 +49,7 @@ APP_DESCRIPTION = """
 | GET | `/v1/stations/{station_id}` | 測定局詳細（住所・観測項目の有無など） |
 | GET | `/v1/measurements` | 局または県・期間の測定データ（`format=series` / `snapshot`） |
 | GET | `/v1/latest` | 局または県の直近最新値 |
-| GET | `/v1/log` | 収集ジョブログ概要（県別 `status_items` + `collect_log` 全文） |
+| GET | `/v1/log` | 収集ジョブログ概要（県別 `status_items` + `ingest_attempts` 由来の `collect_log`） |
 | GET | `/v1/log/prefectures/{pref_id}/history` | 指定県の収集履歴（日×24 時間の充足表） |
 | GET | `/v1/geojson/outline/{pref_id}` | 都道府県輪郭（地図表示用 GeoJSON rings） |
 | GET | `/v1/meta/ai-docs` | LLM 向け利用ガイド（Markdown） |
@@ -138,6 +139,7 @@ app.add_middleware(
 app.include_router(v1_router)
 app.include_router(v1_grid_router)
 app.include_router(v1_amedas_router)
+app.include_router(internal_ingest_router)
 
 # dashboard（Svelte ビルド）を同一ポートで配信
 if DASHBOARD_DIST.is_dir():

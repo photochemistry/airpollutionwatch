@@ -27,7 +27,8 @@ from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from routers.v1 import DB_PATH, ITEM_PARAM_TO_COL
+from config import connect_db
+from routers.v1 import ITEM_PARAM_TO_COL
 from grid.cache import (
     GridCacheEntry,
     evict_old_cache,
@@ -142,7 +143,7 @@ def _fetch_station_snapshot(target_dt_iso: str, item_col: str) -> pd.DataFrame:
             AND m.target_datetime = latest.max_dt
         WHERE m.{item_col} IS NOT NULL
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         df = pd.read_sql_query(query, conn, params=(target_dt_iso,))
     return df
 
@@ -254,7 +255,7 @@ def _fetch_station_count(target_dt_iso: str, item_col: str) -> int:
             AND m.target_datetime = latest.max_dt
         WHERE m.{item_col} IS NOT NULL
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         return conn.execute(query, (target_dt_iso,)).fetchone()[0]
 
 
@@ -281,7 +282,7 @@ def _fetch_station_snapshot_meta(target_dt_iso: str, item_col: str) -> tuple[int
             AND m.target_datetime = latest.max_dt
         WHERE m.{item_col} IS NOT NULL
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         row = conn.execute(query, (target_dt_iso,)).fetchone()
     if row is None:
         return 0, None
@@ -294,7 +295,7 @@ def ensure_grid_db_indexes() -> None:
     重複作成は IF NOT EXISTS で回避する。
     """
     try:
-        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        with connect_db(timeout=30.0) as conn:
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_measurements_target_station

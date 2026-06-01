@@ -3,7 +3,6 @@ API v1: 都道府県・測定局・測定データ・収集ログなどのエン
 """
 import datetime
 import json
-import re
 import sqlite3
 from pathlib import Path
 from typing import List, Union, Literal, Dict, Any
@@ -50,11 +49,11 @@ PREF_ID_TO_REGION: Dict[str, str] = {
     "okinawa": "沖縄",
 }
 
-ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "airpollutionwatch.sqlite3"
+from config import ROOT, connect_db
+
 GEOJSON_OUTLINES_DIR = ROOT / "geojson_outlines"
-COLLECT_LOG_PATH = ROOT / "collect.log"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
+INGEST_LOG_LIMIT = 500
 
 # status_items / has_data に載せる追加県（prefecture_retrievers へ未反映の環境向け）
 _COLLECTION_STATUS_EXTRA_PREF_IDS = frozenset({"wakayama"})
@@ -409,7 +408,7 @@ async def get_measurements(
             ) latest ON m.station_code = latest.station_code AND m.target_datetime = latest.max_dt
             WHERE m.station_code IN ({placeholders})
         """
-        with sqlite3.connect(DB_PATH) as conn:
+        with connect_db() as conn:
             df = pd.read_sql_query(query, conn, params=(*codes, from_rounded.isoformat(), *codes))
 
         if df.empty:
@@ -442,7 +441,7 @@ async def get_measurements(
     to_iso = to_rounded.isoformat()
     placeholders = ",".join("?" * len(codes))
     col_list = ", ".join(["station_code", "target_datetime", "observed_datetime"] + cols)
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
@@ -522,7 +521,7 @@ async def get_latest(
 
     placeholders = ",".join("?" * len(codes))
     col_list = ", ".join(["station_code", "target_datetime", "observed_datetime"] + cols)
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(f"SELECT MAX(target_datetime) AS latest FROM measurements WHERE station_code IN ({placeholders})", tuple(codes))
@@ -531,7 +530,7 @@ async def get_latest(
     if not latest:
         return LatestResponse(datetime="", stations=[])
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
@@ -570,20 +569,20 @@ class CollectionStatusItem(BaseModel):
         description="連続データが何日前までさかのぼれるか（日数）。県ごとに取得状況で異なる。",
     )
     has_data: bool = Field(..., description="当該県に測定データが1件以上あるか")
-    log_status: str = Field("ok", description="collect.log 上の状態: ok / warning / error")
-    log_message: str | None = Field(None, description="collect.log の該当県の WARNING/ERROR メッセージ（代表1件）")
+    log_status: str = Field("ok", description="直近の ingest_attempts に基づく状態: ok / warning / error")
+    log_message: str | None = Field(None, description="直近の ingest_attempts の error_message（代表1件）")
     pref_url: str | None = Field(None, description="当該県の公式データページ URL（pref-links.md 由来）")
 
 
 class LogOverviewResponse(BaseModel):
-    """collect.log の概要（県別ステータス + ログ全文）"""
+    """収集ジョブの概要（県別ステータス + ingest_attempts 由来のログテキスト）"""
 
     status_items: List[CollectionStatusItem] = Field(
         ..., description="県ごとの収集巡回状況（直近 target_datetime・経過時間・log_status 等）"
     )
     collect_log: str | None = Field(
         None,
-        description="collect.log の全文（存在しない/読み取れない場合は null）",
+        description="ingest_attempts から生成した収集ログテキスト（後方互換のフィールド名。データなしは null）",
     )
 
 
@@ -643,32 +642,91 @@ def _load_pref_links() -> Dict[str, str]:
     return result
 
 
-def _collect_log_status_per_prefecture() -> Dict[str, tuple[str, str | None]]:
-    """collect.log を解析し、県ごとに「最悪のレベル」とその代表メッセージを返す。レベルは ok / warning / error。"""
-    if not COLLECT_LOG_PATH.exists():
+def _ingest_attempts_table_exists(cur: sqlite3.Cursor) -> bool:
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_attempts'"
+    )
+    return cur.fetchone() is not None
+
+
+def _ingest_status_from_row(
+    status: str | None,
+    error_message: str | None,
+) -> tuple[str, str | None]:
+    """ingest_attempts の1行から log_status / log_message を決める。"""
+    if status == "failed":
+        msg = error_message or "failed to collect"
+        return "warning", f"failed to collect: {msg}"
+    if error_message:
+        return "warning", error_message
+    return "ok", None
+
+
+def _ingest_status_per_prefecture(cur: sqlite3.Cursor) -> Dict[str, tuple[str, str | None]]:
+    """ingest_attempts の最新行から県ごとの log_status / log_message を返す。"""
+    if not _ingest_attempts_table_exists(cur):
         return {}
+    result: Dict[str, tuple[str, str | None]] = {}
+    for pref in collection_prefecture_ids():
+        cur.execute(
+            """
+            SELECT status, error_message
+            FROM ingest_attempts
+            WHERE prefecture = ?
+            ORDER BY attempted_at DESC
+            LIMIT 1
+            """,
+            (pref,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            result[pref] = ("ok", None)
+        else:
+            result[pref] = _ingest_status_from_row(row[0], row[1])
+    return result
+
+
+def _format_attempted_at_for_log(attempted_at: str) -> str:
+    """ingest_attempts.attempted_at をログ表示用に整形する。"""
     try:
-        text = COLLECT_LOG_PATH.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
-    # 行の形式: 2026-03-08 15:00:01,540 WARNING Prefecture aichi: failed to collect: ...
-    level_re = re.compile(r",\d+\s+(WARNING|ERROR|CRITICAL)\s+Prefecture\s+(\w+):\s*(.*)")
-    # severity: 0=ok, 1=warning, 2=error
-    result: Dict[str, tuple[int, str]] = {}
-    for line in text.splitlines():
-        m = level_re.search(line)
-        if not m:
-            continue
-        level_name, pref, message = m.group(1), m.group(2), m.group(3).strip()
-        severity = 2 if level_name in ("ERROR", "CRITICAL") else 1
-        prev = result.get(pref, (0, ""))
-        if severity >= prev[0]:
-            result[pref] = (severity, message)
-    out: Dict[str, tuple[str, str | None]] = {}
-    for pref, (sev, msg) in result.items():
-        level = "error" if sev == 2 else "warning"
-        out[pref] = (level, msg if msg else None)
-    return out
+        dt = datetime.datetime.fromisoformat(attempted_at.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(JST)
+        else:
+            dt = dt.replace(tzinfo=JST)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return attempted_at.replace("T", " ")[:19]
+
+
+def _build_ingest_log_text(cur: sqlite3.Cursor, *, limit: int = INGEST_LOG_LIMIT) -> str | None:
+    """ingest_attempts から collect_log 互換のテキストログを生成する。"""
+    if not _ingest_attempts_table_exists(cur):
+        return None
+    cur.execute(
+        """
+        SELECT prefecture, target_datetime, status, error_message, attempted_at
+        FROM ingest_attempts
+        ORDER BY attempted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None
+    lines: list[str] = []
+    for pref, target_dt, status, error_message, attempted_at in reversed(rows):
+        ts = _format_attempted_at_for_log(attempted_at)
+        if status == "ok" and not error_message:
+            lines.append(f"{ts} INFO Collecting {pref} at {target_dt}")
+        elif status == "ok" and error_message:
+            lines.append(f"{ts} WARNING Prefecture {pref}: {error_message}")
+        else:
+            lines.append(
+                f"{ts} WARNING Prefecture {pref}: failed to collect: {error_message or 'unknown'}"
+            )
+    return "\n".join(lines)
 
 
 def _parse_db_datetime_utc(iso_str: str) -> datetime.datetime | None:
@@ -735,14 +793,14 @@ def _parse_end_hour_utc(end_iso: str | None) -> datetime.datetime:
 
 
 def _get_collection_status_items() -> List[CollectionStatusItem]:
-    """各県の収集巡回状況を一覧で返す。collect.log が存在する場合は県ごとの状態（ok/warning/error）と代表メッセージを付与する。"""
+    """各県の収集巡回状況を一覧で返す。ingest_attempts があれば県ごとの log_status / log_message も付与する。"""
     now = datetime.datetime.now(UTC)
-    log_status_map = _collect_log_status_per_prefecture()
     pref_links = _load_pref_links()
     result: List[CollectionStatusItem] = []
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         cur = conn.cursor()
+        log_status_map = _ingest_status_per_prefecture(cur)
         for pref in collection_prefecture_ids():
             cur.execute(
                 "SELECT MAX(target_datetime) AS latest FROM measurements WHERE prefecture = ?",
@@ -786,19 +844,19 @@ def _get_collection_status_items() -> List[CollectionStatusItem]:
 async def collect_log_overview():
     """収集ジョブの概要を JSON で返します。
 
-    - **status_items**: 県ごとの収集状況（最新時刻・連続データ期間・log 上の warning/error 等）
-    - **collect_log**: `collect.log` の全文（存在しない場合は null）
+    - **status_items**: 県ごとの収集状況（最新時刻・連続データ期間・ingest_attempts 由来の log_status 等）
+    - **collect_log**: `ingest_attempts` から生成したログテキスト（データなしの場合は null）
 
     データ欠損の原因調査や運用監視に使用します。
     """
     status_items = _get_collection_status_items()
 
     collect_text: str | None = None
-    if COLLECT_LOG_PATH.exists():
-        try:
-            collect_text = COLLECT_LOG_PATH.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            collect_text = None
+    try:
+        with connect_db() as conn:
+            collect_text = _build_ingest_log_text(conn.cursor())
+    except sqlite3.Error:
+        collect_text = None
 
     return LogOverviewResponse(status_items=status_items, collect_log=collect_text)
 
@@ -824,7 +882,7 @@ async def collect_log_pref_history(
     end_hour_utc = _parse_end_hour_utc(end)
     start_hour_utc = end_hour_utc - datetime.timedelta(hours=(days * 24 - 1))
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         cur = conn.cursor()
         cur.execute(
             """

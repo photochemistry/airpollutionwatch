@@ -98,7 +98,7 @@ LLM クライアントから使う場合は、**次の 3 系統のエンドポ�
 ### 3.3 監視 / メタ情報
 
 - **どこまで履歴が埋まっているか / 収集ジョブログ**
-  - `GET /v1/log`（JSON: 県別ステータス `status_items` と `collect_log` 本文。`status_items` の `oldest_continuous_datetime`・`continuous_days_ago` で連続データ期間も確認可能）
+  - `GET /v1/log`（JSON: 県別ステータス `status_items` と `ingest_attempts` 由来の `collect_log` テキスト。`status_items` の `oldest_continuous_datetime`・`continuous_days_ago` で連続データ期間も確認可能）
 
 AI エージェントが自動運用を補助する場合、  
 「データがないことによるエラー」かどうか判断するために `/v1/log` を併用するとよいです。
