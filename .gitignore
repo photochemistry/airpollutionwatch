@@ -8,6 +8,11 @@ __pycache__/
 *.gz
 *.json.[0-9]
 airpollutionwatch.sqlite3
+# 以下は airpollutionwatch-grid 側のキャッシュ（api リポジトリには置かない）
+grid_cache.sqlite3
+grid_response_cache.sqlite3
+amedas_cache.sqlite3
+grid_auth.sqlite3
 *.log
 *.sqlite3
 

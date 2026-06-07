@@ -4,4 +4,4 @@ ALERT_FAILURE_HOURS=3
 
 # ingest from crawlers
 # arbitrary token identical to that in the crawler
-AIRPOLLUTIONWATCH_INGEST_TOKEN="..." 
+AIRPOLLUTIONWATCH_INGEST_TOKEN="..."

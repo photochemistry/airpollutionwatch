@@ -16,7 +16,7 @@ Web API 経由で参照できるようにするサービスです。
   FastAPI 標準の Swagger UI。全エンドポイント・パラメータ・スキーマを日本語で参照できます。
 - **バージョン**: 現行のエンドポイントは **v1** として `/v1/...` にあります（例: `/v1/prefectures`, `/v1/measurements`）。
 
-> **Note**: この README は主要エンドポイントの簡易ガイドです。グリッド API（`/v1/grid`）やアメダス（`/v1/amedas`）なども含めた完全なリファレンスは Swagger UI（`/docs`）を参照してください。
+> **Note**: 空間補間グリッド（`/v1/grid`）とアメダス（`/v1/amedas`）は別プロジェクト **airpollutionwatch-grid**（ポート 8090）で提供しています。本 README は局データ API（v1）の簡易ガイドです。
 
 提供する主な機能:
 
@@ -55,15 +55,20 @@ poetry run python api.py
 | `AIRPOLLUTIONWATCH_DB_PATH` | 測定データ SQLite のパス。省略時は本リポジトリ直下の `airpollutionwatch.sqlite3` |
 | `AIRPOLLUTIONWATCH_INGEST_TOKEN` | 内部 ingest API（`POST /internal/ingest/measurements`）の Bearer トークン |
 | `AIRPOLLUTIONWATCH_INGEST_TOKEN_FILE` | 内部 ingest API で使うトークンファイルのパス（本文を token として利用） |
-| `ALERT_FAILURE_HOURS` | 収集失敗アラート発報までの連続失敗時間（時間）。既定 `3` |
+| `AIRPOLLUTIONWATCH_GRID_API_URL` | ingest 後に grid キャッシュを無効化する先（省略時 `http://127.0.0.1:8090`）。[airpollutionwatch-grid](../airpollutionwatch-grid) の `/internal/invalidate-cache` |
+| `ALERT_FAILURE_HOURS` | 収集失敗・測定値空欄（DB に有効な測定値がない）のアラート発報までの継続時間（時間）。既定 `3` |
 | `ALERT_DISCORD_WEBHOOK_URL` | Discord 通知先 webhook URL（`DISCORD_WEBHOOK_URL` でも可） |
 
 `collect_hourly.py`（crawler）と **同じパス** を指定してください。接続時に SQLite WAL モードを有効化します。
+
+測定データ以外の SQLite（`grid_cache.sqlite3` 等）は [airpollutionwatch-grid](../airpollutionwatch-grid) 側で管理します。本リポジトリに置かないでください。
 
 ```bash
 export AIRPOLLUTIONWATCH_DB_PATH=/var/lib/airpollutionwatch/airpollutionwatch.sqlite3
 poetry run python api.py
 ```
+
+グリッド API（`/v1/grid`, `/v1/amedas`）は別リポジトリ [airpollutionwatch-grid](../airpollutionwatch-grid)（ポート 8090）で起動してください。
 
 ### 3. ダッシュボードを同一ポートで配信する場合（オプション）
 

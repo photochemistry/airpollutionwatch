@@ -50,6 +50,7 @@ PREF_ID_TO_REGION: Dict[str, str] = {
 }
 
 from config import ROOT, connect_db
+from data.item_mapping import ITEM_PARAM_TO_COL
 
 GEOJSON_OUTLINES_DIR = ROOT / "geojson_outlines"
 AI_DOC_PATH = ROOT / "docs" / "ai-clients.md"
@@ -152,13 +153,6 @@ class PrefectureInfo(BaseModel):
     name_ja: str = Field(..., description="都道府県の日本語名")
     has_data: bool = Field(..., description="当該県のデータが API で取得可能か")
     region: str = Field(..., description="地域ブロック（北海道・東北・関東・中部・近畿・中国・四国・九州・沖縄）")
-
-
-ITEM_PARAM_TO_COL = {
-    "so2": "SO2", "no": "NO", "no2": "NO2", "nox": "NOX", "ox": "OX",
-    "spm": "SPM", "pm25": "PM25", "co": "CO", "nmhc": "NMHC", "ch4": "CH4",
-    "thc": "THC", "wd": "WD", "ws": "WS", "temp": "TEMP", "hum": "HUM",
-}
 
 
 class HourlyStationPoint(BaseModel):
@@ -625,24 +619,53 @@ class LogOverviewResponse(BaseModel):
     )
 
 
+PrefHistoryCellStatus = Literal["ok", "missing", "empty"]
+
+# internal_ingest._POLLUTANT_DB_COLS と同じ（usable 判定）
+_MEASUREMENT_POLLUTANT_COLS = (
+    "SO2",
+    "NO",
+    "NO2",
+    "NOX",
+    "OX",
+    "SPM",
+    "PM25",
+    "CO",
+    "NMHC",
+    "CH4",
+    "THC",
+)
+
+
 class PrefHistoryCell(BaseModel):
     hour: int = Field(..., ge=0, le=23, description="時刻（0-23）")
-    has_data: bool = Field(..., description="当該日の当該時間にデータが存在するか")
-    status: Literal["ok", "missing"] = Field(..., description="ok=データあり, missing=欠損")
+    has_data: bool = Field(
+        ...,
+        description="当該正時に usable な測定値があるか（status=ok のとき true）",
+    )
+    status: PrefHistoryCellStatus = Field(
+        ...,
+        description="ok=測定値あり, empty=行のみ（全項目欠測）, missing=行なし",
+    )
 
 
 class PrefHistoryDayRow(BaseModel):
     date: str = Field(..., description="日付（YYYY-MM-DD, JST）")
     cells: List[PrefHistoryCell] = Field(..., description="0-23時のセル")
-    ok_count: int = Field(..., description="当日のデータありスロット数")
-    missing_count: int = Field(..., description="当日の欠損スロット数")
+    ok_count: int = Field(..., description="当日の測定値ありスロット数")
+    empty_count: int = Field(..., description="当日の行のみ（全項目欠測）スロット数")
+    missing_count: int = Field(..., description="当日の行なしスロット数")
 
 
 class PrefHistorySummary(BaseModel):
     total_slots: int = Field(..., description="対象スロット総数（days*24）")
-    ok_slots: int = Field(..., description="データありスロット数")
-    missing_slots: int = Field(..., description="欠損スロット数")
-    coverage_ratio: float = Field(..., description="充足率（ok_slots/total_slots）")
+    ok_slots: int = Field(..., description="測定値ありスロット数")
+    empty_slots: int = Field(..., description="行のみ（全項目欠測）スロット数")
+    missing_slots: int = Field(..., description="行なしスロット数")
+    coverage_ratio: float = Field(
+        ...,
+        description="usable 充足率（ok_slots/total_slots）。empty は含めない",
+    )
     oldest_continuous_datetime: str | None = Field(
         None,
         description="最新から1時間刻みで欠けなしに遡れる最古の時刻（JST）",
@@ -801,6 +824,43 @@ def _oldest_continuous_from_datetimes(dts_utc: list[datetime.datetime]) -> tuple
     return oldest_jst.isoformat(), round(delta_days, 1)
 
 
+def _usable_pollutant_sql(prefix: str = "") -> str:
+    """measurements 行に usable な測定値があるかの SQL 条件（OR 連結）。"""
+    col = f"{prefix}." if prefix else ""
+    return " OR ".join(f"{col}{c} IS NOT NULL" for c in _MEASUREMENT_POLLUTANT_COLS)
+
+
+def _load_measurement_slot_status(
+    cur: sqlite3.Cursor,
+    *,
+    prefecture: str,
+    start_hour_utc: datetime.datetime,
+    end_hour_utc: datetime.datetime,
+) -> dict[datetime.datetime, PrefHistoryCellStatus]:
+    """正時 UTC → ok（usable あり） / empty（行のみ）。"""
+    cols_or = _usable_pollutant_sql()
+    cur.execute(
+        f"""
+        SELECT target_datetime,
+               MAX(CASE WHEN ({cols_or}) THEN 1 ELSE 0 END) AS has_usable
+        FROM measurements
+        WHERE prefecture = ?
+        GROUP BY target_datetime
+        """,
+        (prefecture,),
+    )
+    out: dict[datetime.datetime, PrefHistoryCellStatus] = {}
+    for target_iso, has_usable in cur.fetchall():
+        dt = _parse_db_datetime_utc(target_iso)
+        if dt is None:
+            continue
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+        if not (start_hour_utc <= dt <= end_hour_utc):
+            continue
+        out[dt] = "ok" if has_usable else "empty"
+    return out
+
+
 def _oldest_continuous_target(cur: sqlite3.Cursor, pref: str) -> tuple[str | None, float | None]:
     """県の target_datetime 一覧から、最新から1時間刻みで連続している区間の最古を求め、その ISO 文字列と「何日前か」を返す。"""
     cur.execute("SELECT DISTINCT target_datetime FROM measurements WHERE prefecture = ?", (pref,))
@@ -953,10 +1013,14 @@ async def collect_log_pref_history(
     days: int = Query(30, ge=1, le=90, description="表示する過去日数（1〜90）"),
     end: str | None = Query(None, description="対象終了時刻（ISO 8601）。省略時は現在時刻の正時"),
 ):
-    """指定都道府県の過去収集履歴を、日×24 時間の充足表（〇×）として返します。
+    """指定都道府県の過去収集履歴を、日×24 時間の充足表として返します。
 
-    各セルは当該日時に `measurements` データが存在するかを示します。
-    `summary.coverage_ratio` で期間全体の充足率を確認できます。
+    各セルの status:
+    - ok: いずれかの測定項目に値がある
+    - empty: measurements 行はあるが全項目欠測（再取得で埋まる可能性あり）
+    - missing: 行なし
+
+    `summary.coverage_ratio` は usable（ok）のみの充足率です。
     """
     if pref_id not in PREF_ID_TO_NAME:
         raise HTTPException(status_code=404, detail=f"未知の都道府県 ID: {pref_id}")
@@ -966,27 +1030,18 @@ async def collect_log_pref_history(
 
     with connect_db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT DISTINCT target_datetime
-            FROM measurements
-            WHERE prefecture = ?
-            """,
-            (pref_id,),
+        slot_status = _load_measurement_slot_status(
+            cur,
+            prefecture=pref_id,
+            start_hour_utc=start_hour_utc,
+            end_hour_utc=end_hour_utc,
         )
-        existing_dt_utc: set[datetime.datetime] = set()
-        for row in cur.fetchall():
-            dt = _parse_db_datetime_utc(row[0])
-            if dt is None:
-                continue
-            if start_hour_utc <= dt <= end_hour_utc:
-                existing_dt_utc.add(dt.replace(minute=0, second=0, microsecond=0))
-
         oldest_continuous_iso, _ = _oldest_continuous_target(cur, pref_id)
 
     rows: List[PrefHistoryDayRow] = []
     total_slots = days * 24
     ok_slots = 0
+    empty_slots = 0
     missing_slots = 0
 
     # 新しい日付から順に返す（ダッシュボードの最新監視に合わせる）
@@ -994,29 +1049,34 @@ async def collect_log_pref_history(
         day_jst = (end_hour_utc.astimezone(JST).date() - datetime.timedelta(days=day_offset))
         cells: List[PrefHistoryCell] = []
         day_ok = 0
+        day_empty = 0
         day_missing = 0
         for hour in range(24):
             dt_jst = datetime.datetime.combine(day_jst, datetime.time(hour=hour, tzinfo=JST))
             dt_utc = dt_jst.astimezone(UTC)
-            has_data = dt_utc in existing_dt_utc
-            if has_data:
+            cell_status = slot_status.get(dt_utc, "missing")
+            if cell_status == "ok":
                 day_ok += 1
+            elif cell_status == "empty":
+                day_empty += 1
             else:
                 day_missing += 1
             cells.append(
                 PrefHistoryCell(
                     hour=hour,
-                    has_data=has_data,
-                    status="ok" if has_data else "missing",
+                    has_data=cell_status == "ok",
+                    status=cell_status,
                 )
             )
         ok_slots += day_ok
+        empty_slots += day_empty
         missing_slots += day_missing
         rows.append(
             PrefHistoryDayRow(
                 date=day_jst.isoformat(),
                 cells=cells,
                 ok_count=day_ok,
+                empty_count=day_empty,
                 missing_count=day_missing,
             )
         )
@@ -1033,6 +1093,7 @@ async def collect_log_pref_history(
         summary=PrefHistorySummary(
             total_slots=total_slots,
             ok_slots=ok_slots,
+            empty_slots=empty_slots,
             missing_slots=missing_slots,
             coverage_ratio=round(coverage_ratio, 4),
             oldest_continuous_datetime=oldest_continuous_iso,
