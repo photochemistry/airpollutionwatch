@@ -41,9 +41,21 @@ poetry install
 
 ### 2. API サーバの起動
 
+開発時（ホットリロードあり）:
+
 ```bash
 poetry run python api.py
 ```
+
+本番・常時運転（pm2）:
+
+```bash
+# API と grid をまとめて起動（ecosystem は本リポジトリ直下）
+pm2 start ecosystem.config.cjs
+pm2 save
+```
+
+再起動後も自動起動する場合は、初回のみ `pm2 startup` の表示どおり sudo コマンドを実行してください。
 
 デフォルトでは `http://0.0.0.0:8089` で待ち受けます。  
 ブラウザで `http://localhost:8089/docs` にアクセスすると、Swagger UI が利用できます。
