@@ -130,6 +130,63 @@ class CollectPlanResponse(BaseModel):
     jobs: list[CollectPlanJob] = Field(..., description="県ごとの収集計画")
 
 
+class VerifyPlanJob(BaseModel):
+    prefecture: str = Field(..., description="都道府県 ID")
+    target_datetime: str = Field(..., description="検証対象の正時（ISO8601）")
+    layer: int = Field(..., description="min_verify_age からの層（0=最も新しい検証層）")
+    lookback_hours: int = Field(
+        ...,
+        description="base_target から何時間前の時刻か",
+    )
+    has_baseline: bool = Field(
+        ...,
+        description="DB に比較用の測定値があるか",
+    )
+
+
+class VerifyPlanResponse(BaseModel):
+    base_target: str = Field(..., description="基準とした現在の正時（ISO8601）")
+    min_verify_age_hours: int = Field(
+        ...,
+        description="直近この時間数は検証対象外（速報値更新中の可能性）",
+    )
+    max_verify_lookback_hours: int = Field(
+        ...,
+        description="検証でさかのぼる上限（時間）。層はこの値で巡回",
+    )
+    cursor: int = Field(..., description="幅優先巡回のカーソル（単調増加）")
+    job: VerifyPlanJob = Field(..., description="今回検証する1県分のジョブ")
+
+
+class MeasurementDiff(BaseModel):
+    station_code: int
+    field: str
+    old_value: float | None
+    new_value: float | None
+
+
+class VerifyReportRequest(BaseModel):
+    prefecture: str = Field(..., description="都道府県 ID")
+    target_datetime: str = Field(..., description="検証対象の正時（ISO8601）")
+    status: Literal["ok", "failed", "skipped"] = Field(
+        ...,
+        description="ok=取得成功, failed=取得失敗, skipped=ベースラインなし等",
+    )
+    error_message: str | None = Field(None, description="失敗・スキップ理由")
+    attempted_at: str | None = Field(None, description="試行時刻（ISO8601、省略時は現在）")
+    rows: list[MeasurementRow] = Field(
+        default_factory=list,
+        description="status=ok のときの再取得測定値",
+    )
+
+
+class VerifyReportResponse(BaseModel):
+    changed_count: int = Field(..., description="検出した差分件数")
+    diffs: list[MeasurementDiff] = Field(..., description="差分一覧")
+    discord_notified: bool = Field(..., description="Discord 通知を送ったか")
+    attempt_logged: bool = Field(..., description="verification_attempts に記録したか")
+
+
 def _ensure_tables(conn) -> None:
     conn.execute(
         """
@@ -178,6 +235,27 @@ def _ensure_tables(conn) -> None:
             target_datetime TEXT NOT NULL,
             alerted_at TEXT NOT NULL,
             PRIMARY KEY (prefecture, target_datetime)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verification_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verification_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefecture TEXT NOT NULL,
+            target_datetime TEXT NOT NULL,
+            status TEXT NOT NULL,
+            changed_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            attempted_at TEXT NOT NULL
         )
         """
     )
@@ -757,6 +835,356 @@ def build_collect_plan(
     )
 
 
+_VERIFY_CURSOR_KEY = "bfs_cursor"
+_VERIFY_FLOAT_EPS = 1e-6
+_VERIFY_DISCORD_DIFF_LIMIT = 10
+
+
+def _get_verification_cursor(conn) -> int:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT value FROM verification_state WHERE key = ?",
+        (_VERIFY_CURSOR_KEY,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return 0
+    try:
+        return max(int(row[0]), 0)
+    except ValueError:
+        return 0
+
+
+def _set_verification_cursor(conn, cursor: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO verification_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (_VERIFY_CURSOR_KEY, str(cursor)),
+    )
+    conn.commit()
+
+
+def _fetch_db_measurements_by_station(
+    conn,
+    *,
+    prefecture: str,
+    target_iso: str,
+) -> dict[int, dict[str, float | None]]:
+    """県・正時の DB 測定値を station_code キーの dict で返す。"""
+    col_list = ", ".join(["station_code", *_POLLUTANT_DB_COLS])
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT {col_list}
+        FROM measurements
+        WHERE prefecture = ? AND target_datetime = ?
+        ORDER BY station_code
+        """,
+        (prefecture, target_iso),
+    )
+    by_station: dict[int, dict[str, float | None]] = {}
+    for row in cur.fetchall():
+        station_code = int(row[0])
+        values = {
+            col: _normalize_pollutant(row[i + 1])
+            for i, col in enumerate(_POLLUTANT_DB_COLS)
+        }
+        if any(v is not None for v in values.values()):
+            by_station[station_code] = values
+    return by_station
+
+
+def _pollutant_values_equal(
+    old: float | None,
+    new: float | None,
+) -> bool:
+    if old is None and new is None:
+        return True
+    if old is None or new is None:
+        return False
+    return abs(float(old) - float(new)) <= _VERIFY_FLOAT_EPS
+
+
+def _row_to_pollutant_dict(row: MeasurementRow) -> dict[str, float | None]:
+    return {
+        col: _normalize_pollutant(getattr(row, attr))
+        for attr, col in zip(_POLLUTANT_ATTRS, _POLLUTANT_DB_COLS, strict=True)
+    }
+
+
+def compare_measurements(
+    baseline: dict[int, dict[str, float | None]],
+    incoming_rows: list[MeasurementRow],
+) -> list[MeasurementDiff]:
+    """DB ベースラインと再取得行を比較し、差分を返す。"""
+    incoming_by_station: dict[int, dict[str, float | None]] = {}
+    for row in incoming_rows:
+        values = _row_to_pollutant_dict(row)
+        if any(v is not None for v in values.values()):
+            incoming_by_station[row.station_code] = values
+
+    diffs: list[MeasurementDiff] = []
+    for station_code, old_values in sorted(baseline.items()):
+        new_values = incoming_by_station.get(station_code)
+        if new_values is None:
+            if any(v is not None for v in old_values.values()):
+                for col, old_val in old_values.items():
+                    if old_val is not None:
+                        diffs.append(
+                            MeasurementDiff(
+                                station_code=station_code,
+                                field=col,
+                                old_value=old_val,
+                                new_value=None,
+                            )
+                        )
+            continue
+        for col in _POLLUTANT_DB_COLS:
+            old_val = old_values.get(col)
+            new_val = new_values.get(col)
+            if not _pollutant_values_equal(old_val, new_val):
+                diffs.append(
+                    MeasurementDiff(
+                        station_code=station_code,
+                        field=col,
+                        old_value=old_val,
+                        new_value=new_val,
+                    )
+                )
+    return diffs
+
+
+def _record_verification_attempt(
+    conn,
+    *,
+    prefecture: str,
+    target_iso: str,
+    status: str,
+    changed_count: int,
+    error_message: str | None,
+    attempted_at_iso: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO verification_attempts (
+            prefecture, target_datetime, status, changed_count,
+            error_message, attempted_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            prefecture,
+            target_iso,
+            status,
+            changed_count,
+            error_message,
+            attempted_at_iso,
+        ),
+    )
+    conn.commit()
+
+
+def _format_diff_value(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{float(value):g}"
+
+
+def _send_discord_revision_alert(
+    *,
+    prefecture: str,
+    target_iso: str,
+    changed_count: int,
+    diffs: list[MeasurementDiff],
+) -> None:
+    webhook = _discord_webhook_url()
+    if not webhook:
+        return
+
+    lines = [
+        "【REVISION】airpollutionwatch 測定値の変更を検出しました",
+        f"- 都道府県: {prefecture}",
+        f"- 対象時刻: {target_iso}",
+        f"- 変更件数: {changed_count}",
+        "- 差分（最大10件）:",
+    ]
+    for diff in diffs[:_VERIFY_DISCORD_DIFF_LIMIT]:
+        lines.append(
+            f"  局 {diff.station_code} {diff.field}: "
+            f"{_format_diff_value(diff.old_value)} → "
+            f"{_format_diff_value(diff.new_value)}"
+        )
+    if changed_count > _VERIFY_DISCORD_DIFF_LIMIT:
+        lines.append(f"  … 他 {changed_count - _VERIFY_DISCORD_DIFF_LIMIT} 件")
+
+    text = "\n".join(lines)
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.post(webhook, json={"content": text})
+        resp.raise_for_status()
+
+
+def build_verify_plan(
+    conn,
+    *,
+    base_target: datetime.datetime,
+    min_verify_age_hours: int = 48,
+    max_verify_lookback_hours: int = 168,
+    prefectures: list[str] | None = None,
+) -> VerifyPlanResponse:
+    """幅優先（BFS）で1県分の検証ジョブを返し、カーソルを進める。"""
+    if min_verify_age_hours < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="min_verify_age_hours は 0 以上で指定してください",
+        )
+    if max_verify_lookback_hours < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="max_verify_lookback_hours は 0 以上で指定してください",
+        )
+
+    pref_ids = prefectures if prefectures is not None else _collect_prefecture_ids()
+    if not pref_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="検証対象の都道府県がありません",
+        )
+
+    cursor = _get_verification_cursor(conn)
+    n_prefs = len(pref_ids)
+    layer = (cursor // n_prefs) % (max_verify_lookback_hours + 1)
+    pref_index = cursor % n_prefs
+    prefecture = pref_ids[pref_index]
+    target = base_target - datetime.timedelta(
+        hours=min_verify_age_hours + layer
+    )
+    target_iso = target.isoformat()
+    lookback_hours = min_verify_age_hours + layer
+    has_baseline = _target_has_usable_measurements(conn, prefecture, target_iso)
+
+    _set_verification_cursor(conn, cursor + 1)
+
+    return VerifyPlanResponse(
+        base_target=base_target.isoformat(),
+        min_verify_age_hours=min_verify_age_hours,
+        max_verify_lookback_hours=max_verify_lookback_hours,
+        cursor=cursor,
+        job=VerifyPlanJob(
+            prefecture=prefecture,
+            target_datetime=target_iso,
+            layer=layer,
+            lookback_hours=lookback_hours,
+            has_baseline=has_baseline,
+        ),
+    )
+
+
+def process_verify_report(
+    conn,
+    req: VerifyReportRequest,
+    *,
+    attempted_at_iso: str,
+) -> VerifyReportResponse:
+    """再取得結果を DB と比較し、差分があれば Discord 通知する。"""
+    target_iso = req.target_datetime
+    if req.status == "failed":
+        _record_verification_attempt(
+            conn,
+            prefecture=req.prefecture,
+            target_iso=target_iso,
+            status="failed",
+            changed_count=0,
+            error_message=req.error_message,
+            attempted_at_iso=attempted_at_iso,
+        )
+        return VerifyReportResponse(
+            changed_count=0,
+            diffs=[],
+            discord_notified=False,
+            attempt_logged=True,
+        )
+
+    baseline = _fetch_db_measurements_by_station(
+        conn,
+        prefecture=req.prefecture,
+        target_iso=target_iso,
+    )
+    if not baseline or req.status == "skipped":
+        _record_verification_attempt(
+            conn,
+            prefecture=req.prefecture,
+            target_iso=target_iso,
+            status="skipped",
+            changed_count=0,
+            error_message=req.error_message or "no baseline in database",
+            attempted_at_iso=attempted_at_iso,
+        )
+        return VerifyReportResponse(
+            changed_count=0,
+            diffs=[],
+            discord_notified=False,
+            attempt_logged=True,
+        )
+
+    if not req.rows:
+        _record_verification_attempt(
+            conn,
+            prefecture=req.prefecture,
+            target_iso=target_iso,
+            status="failed",
+            changed_count=0,
+            error_message=req.error_message or "empty rows",
+            attempted_at_iso=attempted_at_iso,
+        )
+        return VerifyReportResponse(
+            changed_count=0,
+            diffs=[],
+            discord_notified=False,
+            attempt_logged=True,
+        )
+
+    diffs = compare_measurements(baseline, req.rows)
+    changed_count = len(diffs)
+    status_label = "changed" if changed_count > 0 else "unchanged"
+    _record_verification_attempt(
+        conn,
+        prefecture=req.prefecture,
+        target_iso=target_iso,
+        status=status_label,
+        changed_count=changed_count,
+        error_message=req.error_message,
+        attempted_at_iso=attempted_at_iso,
+    )
+
+    discord_notified = False
+    if changed_count > 0:
+        try:
+            _send_discord_revision_alert(
+                prefecture=req.prefecture,
+                target_iso=target_iso,
+                changed_count=changed_count,
+                diffs=diffs,
+            )
+            discord_notified = True
+        except httpx.HTTPError as e:
+            logger.warning(
+                "failed to send discord revision alert: pref=%s target=%s err=%s",
+                req.prefecture,
+                target_iso,
+                e,
+            )
+
+    return VerifyReportResponse(
+        changed_count=changed_count,
+        diffs=diffs,
+        discord_notified=discord_notified,
+        attempt_logged=True,
+    )
+
+
 @router.post(
     "/measurements",
     response_model=IngestResponse,
@@ -860,4 +1288,80 @@ async def get_collect_plan(
             past_collection_enabled=past_collection_enabled,
             prefectures=pref_list,
             backfill_strategy=backfill_strategy,
+        )
+
+
+@router.get(
+    "/verify-plan",
+    response_model=VerifyPlanResponse,
+    summary="内部: crawler 向け検証計画（1県・幅優先）",
+    include_in_schema=False,
+)
+async def get_verify_plan(
+    authorization: str | None = Header(None),
+    base_target: str | None = Query(
+        None,
+        description="基準とする正時（ISO8601）。省略時は現在の正時（JST）",
+    ),
+    min_verify_age_hours: int = Query(
+        48,
+        ge=0,
+        description="直近この時間数は検証しない（速報値の事後更新を待つ）",
+    ),
+    max_verify_lookback_hours: int = Query(
+        168,
+        ge=0,
+        description="検証でさかのぼる上限（時間）。層はこの値で巡回",
+    ),
+    prefectures: str | None = Query(
+        None,
+        description="対象県 ID をカンマ区切りで指定（省略時は全収集対象県）",
+    ),
+):
+    """幅優先（全県を同じ層で巡ってから次の時間層へ）で、次に検証する1県を返す。"""
+    verify_ingest_token(authorization)
+
+    base_dt = _parse_base_target_iso(base_target)
+    pref_list: list[str] | None = None
+    if prefectures is not None:
+        pref_list = [p.strip() for p in prefectures.split(",") if p.strip()]
+        if not pref_list:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="prefectures が空です",
+            )
+
+    with connect_db(timeout=30.0) as conn:
+        _ensure_tables(conn)
+        return build_verify_plan(
+            conn,
+            base_target=base_dt,
+            min_verify_age_hours=min_verify_age_hours,
+            max_verify_lookback_hours=max_verify_lookback_hours,
+            prefectures=pref_list,
+        )
+
+
+@router.post(
+    "/verify-report",
+    response_model=VerifyReportResponse,
+    summary="内部: 再取得結果の検証・差分通知",
+    include_in_schema=False,
+)
+async def post_verify_report(
+    req: VerifyReportRequest,
+    authorization: str | None = Header(None),
+):
+    """再取得した測定値を DB と比較し、差分があれば Discord に通知する。"""
+    verify_ingest_token(authorization)
+
+    now_iso = datetime.datetime.now(JST).isoformat()
+    attempted_at_iso = req.attempted_at or now_iso
+
+    with connect_db(timeout=30.0) as conn:
+        _ensure_tables(conn)
+        return process_verify_report(
+            conn,
+            req,
+            attempted_at_iso=attempted_at_iso,
         )
