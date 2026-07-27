@@ -1,7 +1,24 @@
-# Discord alert
+# Discord alert（収集失敗・空データ）
 ALERT_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/15..."
 ALERT_FAILURE_HOURS=3
+
+# verify 差分通知（REVISION）専用
+REVISION_DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/15..."
+
+# Nostr 公開フィード（nsec は git に含めない）
+# ALERT: display_name "APW アラート", name apw-alert
+ALERT_NOSTR_NSEC="nsec1..."
+ALERT_NOSTR_RELAYS=["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
+# REVISION: display_name "APW Revision", name apw-revision
+REVISION_NOSTR_NSEC="nsec1..."
+REVISION_NOSTR_RELAYS=["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
 
 # ingest from crawlers
 # arbitrary token identical to that in the crawler
 AIRPOLLUTIONWATCH_INGEST_TOKEN="..."
+
+# verify 差分検知時に measurements へ即 UPSERT（既定 false）
+VERIFY_APPLY_CHANGES=true
+
+# 同一 (県, 正時) の REVISION 再通知抑止（分）。既定 10
+REVISION_ALERT_COOLDOWN_MINUTES=10

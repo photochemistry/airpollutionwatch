@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 import os
 from typing import Literal
 
@@ -15,6 +16,8 @@ from fastapi import APIRouter, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from airpollutionwatch import prefecture_retrievers
+
+import notify as notify_channels
 
 from auth_tokens import (
     INGEST_TOKEN_ENV,
@@ -154,8 +157,15 @@ class VerifyPlanResponse(BaseModel):
         ...,
         description="検証でさかのぼる上限（時間）。層はこの値で巡回",
     )
-    cursor: int = Field(..., description="幅優先巡回のカーソル（単調増加）")
-    job: VerifyPlanJob = Field(..., description="今回検証する1県分のジョブ")
+    cursor: int = Field(..., description="層巡回のカーソル（単調増加）")
+    layer: int = Field(
+        ...,
+        description="今回の検証層（全県共通。0=最も新しい検証層）",
+    )
+    jobs: list[VerifyPlanJob] = Field(
+        ...,
+        description="今回検証する全県分のジョブ（同一 layer）",
+    )
 
 
 class MeasurementDiff(BaseModel):
@@ -181,10 +191,24 @@ class VerifyReportRequest(BaseModel):
 
 
 class VerifyReportResponse(BaseModel):
+    prefecture: str = Field(..., description="都道府県 ID")
+    target_datetime: str = Field(..., description="検証対象の正時（ISO8601）")
     changed_count: int = Field(..., description="検出した差分件数")
     diffs: list[MeasurementDiff] = Field(..., description="差分一覧")
     discord_notified: bool = Field(..., description="Discord 通知を送ったか")
+    revision_notify_suppressed: bool = Field(
+        False,
+        description="直近の同一スロット通知済みのため REVISION 通知を抑止したか",
+    )
     attempt_logged: bool = Field(..., description="verification_attempts に記録したか")
+    applied_rows: int = Field(0, description="VERIFY_APPLY_CHANGES 時に UPSERT した行数")
+    revisions_logged: int = Field(0, description="measurement_revisions に記録した件数")
+    evicted_grid_cache: int = Field(0, description="grid キャッシュ無効化件数")
+    evicted_response_cache: int = Field(0, description="grid レスポンスキャッシュ無効化件数")
+    andersan_notified: bool = Field(
+        False,
+        description="Andersan API へ測定値修正通知を送ったか",
+    )
 
 
 def _ensure_tables(conn) -> None:
@@ -259,6 +283,31 @@ def _ensure_tables(conn) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS measurement_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefecture TEXT NOT NULL,
+            target_datetime TEXT NOT NULL,
+            station_code INTEGER NOT NULL,
+            field TEXT NOT NULL,
+            old_value REAL,
+            new_value REAL,
+            source TEXT NOT NULL DEFAULT 'verify',
+            detected_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS revision_alert_sent (
+            prefecture TEXT NOT NULL,
+            target_datetime TEXT NOT NULL,
+            alerted_at TEXT NOT NULL,
+            PRIMARY KEY (prefecture, target_datetime)
+        )
+        """
+    )
     conn.commit()
 
 
@@ -266,7 +315,7 @@ def _normalize_pollutant(value: float | None) -> float | None:
     if value is None:
         return None
     v = float(value)
-    return None if v >= 999 else v
+    return None if math.isnan(v) or v >= 999 else v
 
 
 def _row_has_usable_pollutant(row: MeasurementRow) -> bool:
@@ -323,10 +372,19 @@ def purge_empty_measurements(
     return count
 
 
-def _insert_measurements(conn, req: IngestRequest, now_iso: str) -> int:
-    if req.status != "ok" or not req.rows:
+def _upsert_measurement_rows(
+    conn,
+    *,
+    prefecture: str,
+    target_datetime: str,
+    rows: list[MeasurementRow],
+    now_iso: str,
+    require_usable: bool = True,
+) -> int:
+    """測定行を measurements へ UPSERT する。"""
+    if not rows:
         return 0
-    if not _payload_has_usable_rows(req.rows):
+    if require_usable and not _payload_has_usable_rows(rows):
         return 0
     written = 0
     cur = conn.cursor()
@@ -341,11 +399,11 @@ def _insert_measurements(conn, req: IngestRequest, now_iso: str) -> int:
         "created_at",
     )
     update_assignments = ", ".join(f"{c}=excluded.{c}" for c in data_cols)
-    for row in req.rows:
+    for row in rows:
         values = {
-            "prefecture": req.prefecture,
+            "prefecture": prefecture,
             "station_code": row.station_code,
-            "target_datetime": req.target_datetime,
+            "target_datetime": target_datetime,
             "observed_datetime": row.observed_datetime,
             "SO2": _normalize_pollutant(row.so2),
             "NO": _normalize_pollutant(row.no),
@@ -386,6 +444,19 @@ def _insert_measurements(conn, req: IngestRequest, now_iso: str) -> int:
             written += 1
     conn.commit()
     return written
+
+
+def _insert_measurements(conn, req: IngestRequest, now_iso: str) -> int:
+    if req.status != "ok" or not req.rows:
+        return 0
+    return _upsert_measurement_rows(
+        conn,
+        prefecture=req.prefecture,
+        target_datetime=req.target_datetime,
+        rows=req.rows,
+        now_iso=now_iso,
+        require_usable=True,
+    )
 
 
 def _record_attempt(
@@ -617,6 +688,40 @@ def _evict_caches(target_datetime: str) -> tuple[int, int]:
         return 0, 0
 
 
+def _notify_andersan_measurement_revision(
+    *,
+    prefecture: str,
+    target_datetime: str,
+    changed_count: int,
+) -> bool:
+    """Andersan 予測 API へ測定値修正を通知する（未設定時はスキップ）。"""
+    base = os.environ.get(ANDERSAN_API_URL_ENV, "").strip().rstrip("/")
+    if not base:
+        return False
+    token = resolve_expected_token(INGEST_TOKEN_ENV, INGEST_TOKEN_FILE_ENV)
+    if not token:
+        logger.warning("Andersan 通知をスキップ: ingest トークン未設定")
+        return False
+    url = f"{base}/internal/invalidate-measurements"
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                url,
+                json={
+                    "prefecture": prefecture,
+                    "target_datetime": target_datetime,
+                    "changed_count": changed_count,
+                    "source": "verify",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        resp.raise_for_status()
+        return True
+    except httpx.HTTPError as e:
+        logger.warning("Andersan 測定値修正通知に失敗 (%s): %s", url, e)
+        return False
+
+
 def _compute_target_hour(now: datetime.datetime | None = None) -> datetime.datetime:
     """現在の正時（JST）を返す。"""
     if now is None:
@@ -836,8 +941,54 @@ def build_collect_plan(
 
 
 _VERIFY_CURSOR_KEY = "bfs_cursor"
+_VERIFY_EPOCH_KEY = "verify_epoch_base"
 _VERIFY_FLOAT_EPS = 1e-6
-_VERIFY_DISCORD_DIFF_LIMIT = 10
+VERIFY_APPLY_CHANGES_ENV = "VERIFY_APPLY_CHANGES"
+REVISION_ALERT_COOLDOWN_MINUTES_ENV = "REVISION_ALERT_COOLDOWN_MINUTES"
+ANDERSAN_API_URL_ENV = "ANDERSAN_API_URL"
+_DEFAULT_REVISION_ALERT_COOLDOWN_MINUTES = 10
+
+
+def _verify_apply_changes_enabled() -> bool:
+    return os.environ.get(VERIFY_APPLY_CHANGES_ENV, "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _revision_alert_cooldown_minutes() -> int:
+    raw = os.environ.get(
+        REVISION_ALERT_COOLDOWN_MINUTES_ENV,
+        str(_DEFAULT_REVISION_ALERT_COOLDOWN_MINUTES),
+    ).strip()
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return _DEFAULT_REVISION_ALERT_COOLDOWN_MINUTES
+
+
+def _get_verification_state(conn, key: str) -> str | None:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT value FROM verification_state WHERE key = ?",
+        (key,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _set_verification_state(conn, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO verification_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+    conn.commit()
 
 
 def _get_verification_cursor(conn) -> int:
@@ -856,14 +1007,45 @@ def _get_verification_cursor(conn) -> int:
 
 
 def _set_verification_cursor(conn, cursor: int) -> None:
-    conn.execute(
-        """
-        INSERT INTO verification_state (key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (_VERIFY_CURSOR_KEY, str(cursor)),
-    )
-    conn.commit()
+    _set_verification_state(conn, _VERIFY_CURSOR_KEY, str(cursor))
+
+
+def _parse_iso_datetime(value: str) -> datetime.datetime:
+    dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=JST)
+    else:
+        dt = dt.astimezone(JST)
+    return dt
+
+
+def _verify_layer_and_target(
+    conn,
+    *,
+    base_target: datetime.datetime,
+    min_verify_age_hours: int,
+    max_verify_lookback_hours: int,
+    cursor: int,
+) -> tuple[int, datetime.datetime, int]:
+    """layer 巡回の検証正時を返す。
+
+    base_target の正時進行と layer 進行が同調すると同一 target が重複するため、
+    巡回サイクル開始（layer=0）時の epoch を固定アンカーとして使う。
+    """
+    layer = cursor % (max_verify_lookback_hours + 1)
+    if layer == 0:
+        _set_verification_state(conn, _VERIFY_EPOCH_KEY, base_target.isoformat())
+
+    epoch_iso = _get_verification_state(conn, _VERIFY_EPOCH_KEY)
+    if epoch_iso is None:
+        epoch = base_target
+        _set_verification_state(conn, _VERIFY_EPOCH_KEY, epoch.isoformat())
+    else:
+        epoch = _parse_iso_datetime(epoch_iso)
+
+    target = epoch - datetime.timedelta(hours=min_verify_age_hours + layer)
+    lookback_hours = min_verify_age_hours + layer
+    return layer, target, lookback_hours
 
 
 def _fetch_db_measurements_by_station(
@@ -921,9 +1103,7 @@ def compare_measurements(
     """DB ベースラインと再取得行を比較し、差分を返す。"""
     incoming_by_station: dict[int, dict[str, float | None]] = {}
     for row in incoming_rows:
-        values = _row_to_pollutant_dict(row)
-        if any(v is not None for v in values.values()):
-            incoming_by_station[row.station_code] = values
+        incoming_by_station[row.station_code] = _row_to_pollutant_dict(row)
 
     diffs: list[MeasurementDiff] = []
     for station_code, old_values in sorted(baseline.items()):
@@ -985,45 +1165,111 @@ def _record_verification_attempt(
     conn.commit()
 
 
-def _format_diff_value(value: float | None) -> str:
-    if value is None:
-        return "—"
-    if float(value).is_integer():
-        return str(int(value))
-    return f"{float(value):g}"
-
-
-def _send_discord_revision_alert(
+def _record_measurement_revisions(
+    conn,
     *,
     prefecture: str,
     target_iso: str,
-    changed_count: int,
     diffs: list[MeasurementDiff],
+    detected_at_iso: str,
+) -> int:
+    if not diffs:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO measurement_revisions (
+            prefecture, target_datetime, station_code, field,
+            old_value, new_value, source, detected_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'verify', ?)
+        """,
+        [
+            (
+                prefecture,
+                target_iso,
+                diff.station_code,
+                diff.field,
+                diff.old_value,
+                diff.new_value,
+                detected_at_iso,
+            )
+            for diff in diffs
+        ],
+    )
+    conn.commit()
+    return len(diffs)
+
+
+def _revision_notify_suppressed(
+    conn,
+    *,
+    prefecture: str,
+    target_iso: str,
+    attempted_at_iso: str,
+) -> bool:
+    """同一 (県, 正時) の REVISION をクールダウン内に送っていたら True。"""
+    cooldown = _revision_alert_cooldown_minutes()
+    if cooldown <= 0:
+        return False
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT alerted_at FROM revision_alert_sent
+        WHERE prefecture = ? AND target_datetime = ?
+        """,
+        (prefecture, target_iso),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return False
+    try:
+        last_alerted = _parse_iso_datetime(str(row[0]))
+        attempted_at = _parse_iso_datetime(attempted_at_iso)
+    except ValueError:
+        return False
+    return (attempted_at - last_alerted) < datetime.timedelta(minutes=cooldown)
+
+
+def _record_revision_alert_sent(
+    conn,
+    *,
+    prefecture: str,
+    target_iso: str,
+    alerted_at_iso: str,
 ) -> None:
-    webhook = _discord_webhook_url()
-    if not webhook:
-        return
+    conn.execute(
+        """
+        INSERT INTO revision_alert_sent (prefecture, target_datetime, alerted_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(prefecture, target_datetime) DO UPDATE SET
+            alerted_at = excluded.alerted_at
+        """,
+        (prefecture, target_iso, alerted_at_iso),
+    )
+    conn.commit()
 
-    lines = [
-        "【REVISION】airpollutionwatch 測定値の変更を検出しました",
-        f"- 都道府県: {prefecture}",
-        f"- 対象時刻: {target_iso}",
-        f"- 変更件数: {changed_count}",
-        "- 差分（最大10件）:",
-    ]
-    for diff in diffs[:_VERIFY_DISCORD_DIFF_LIMIT]:
-        lines.append(
-            f"  局 {diff.station_code} {diff.field}: "
-            f"{_format_diff_value(diff.old_value)} → "
-            f"{_format_diff_value(diff.new_value)}"
-        )
-    if changed_count > _VERIFY_DISCORD_DIFF_LIMIT:
-        lines.append(f"  … 他 {changed_count - _VERIFY_DISCORD_DIFF_LIMIT} 件")
 
-    text = "\n".join(lines)
-    with httpx.Client(timeout=10.0) as client:
-        resp = client.post(webhook, json={"content": text})
-        resp.raise_for_status()
+def _verify_report_response(
+    req: VerifyReportRequest,
+    *,
+    changed_count: int = 0,
+    diffs: list[MeasurementDiff] | None = None,
+    discord_notified: bool = False,
+    revision_notify_suppressed: bool = False,
+    attempt_logged: bool = True,
+    applied_rows: int = 0,
+    revisions_logged: int = 0,
+) -> VerifyReportResponse:
+    return VerifyReportResponse(
+        prefecture=req.prefecture,
+        target_datetime=req.target_datetime,
+        changed_count=changed_count,
+        diffs=diffs or [],
+        discord_notified=discord_notified,
+        revision_notify_suppressed=revision_notify_suppressed,
+        attempt_logged=attempt_logged,
+        applied_rows=applied_rows,
+        revisions_logged=revisions_logged,
+    )
 
 
 def build_verify_plan(
@@ -1034,7 +1280,7 @@ def build_verify_plan(
     max_verify_lookback_hours: int = 168,
     prefectures: list[str] | None = None,
 ) -> VerifyPlanResponse:
-    """幅優先（BFS）で1県分の検証ジョブを返し、カーソルを進める。"""
+    """全県を同一 layer で検証するジョブ一覧を返し、カーソルを進める。"""
     if min_verify_age_hours < 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1054,16 +1300,28 @@ def build_verify_plan(
         )
 
     cursor = _get_verification_cursor(conn)
-    n_prefs = len(pref_ids)
-    layer = (cursor // n_prefs) % (max_verify_lookback_hours + 1)
-    pref_index = cursor % n_prefs
-    prefecture = pref_ids[pref_index]
-    target = base_target - datetime.timedelta(
-        hours=min_verify_age_hours + layer
+    layer, target, lookback_hours = _verify_layer_and_target(
+        conn,
+        base_target=base_target,
+        min_verify_age_hours=min_verify_age_hours,
+        max_verify_lookback_hours=max_verify_lookback_hours,
+        cursor=cursor,
     )
     target_iso = target.isoformat()
-    lookback_hours = min_verify_age_hours + layer
-    has_baseline = _target_has_usable_measurements(conn, prefecture, target_iso)
+
+    jobs: list[VerifyPlanJob] = []
+    for prefecture in pref_ids:
+        jobs.append(
+            VerifyPlanJob(
+                prefecture=prefecture,
+                target_datetime=target_iso,
+                layer=layer,
+                lookback_hours=lookback_hours,
+                has_baseline=_target_has_usable_measurements(
+                    conn, prefecture, target_iso
+                ),
+            )
+        )
 
     _set_verification_cursor(conn, cursor + 1)
 
@@ -1072,13 +1330,8 @@ def build_verify_plan(
         min_verify_age_hours=min_verify_age_hours,
         max_verify_lookback_hours=max_verify_lookback_hours,
         cursor=cursor,
-        job=VerifyPlanJob(
-            prefecture=prefecture,
-            target_datetime=target_iso,
-            layer=layer,
-            lookback_hours=lookback_hours,
-            has_baseline=has_baseline,
-        ),
+        layer=layer,
+        jobs=jobs,
     )
 
 
@@ -1088,7 +1341,7 @@ def process_verify_report(
     *,
     attempted_at_iso: str,
 ) -> VerifyReportResponse:
-    """再取得結果を DB と比較し、差分があれば Discord 通知する。"""
+    """再取得結果を DB と比較し、差分があれば通知・任意で UPSERT する。"""
     target_iso = req.target_datetime
     if req.status == "failed":
         _record_verification_attempt(
@@ -1100,12 +1353,7 @@ def process_verify_report(
             error_message=req.error_message,
             attempted_at_iso=attempted_at_iso,
         )
-        return VerifyReportResponse(
-            changed_count=0,
-            diffs=[],
-            discord_notified=False,
-            attempt_logged=True,
-        )
+        return _verify_report_response(req)
 
     baseline = _fetch_db_measurements_by_station(
         conn,
@@ -1122,12 +1370,7 @@ def process_verify_report(
             error_message=req.error_message or "no baseline in database",
             attempted_at_iso=attempted_at_iso,
         )
-        return VerifyReportResponse(
-            changed_count=0,
-            diffs=[],
-            discord_notified=False,
-            attempt_logged=True,
-        )
+        return _verify_report_response(req)
 
     if not req.rows:
         _record_verification_attempt(
@@ -1139,15 +1382,29 @@ def process_verify_report(
             error_message=req.error_message or "empty rows",
             attempted_at_iso=attempted_at_iso,
         )
-        return VerifyReportResponse(
-            changed_count=0,
-            diffs=[],
-            discord_notified=False,
-            attempt_logged=True,
-        )
+        return _verify_report_response(req)
 
     diffs = compare_measurements(baseline, req.rows)
     changed_count = len(diffs)
+    applied_rows = 0
+    revisions_logged = 0
+    if changed_count > 0 and _verify_apply_changes_enabled():
+        revisions_logged = _record_measurement_revisions(
+            conn,
+            prefecture=req.prefecture,
+            target_iso=target_iso,
+            diffs=diffs,
+            detected_at_iso=attempted_at_iso,
+        )
+        applied_rows = _upsert_measurement_rows(
+            conn,
+            prefecture=req.prefecture,
+            target_datetime=target_iso,
+            rows=req.rows,
+            now_iso=attempted_at_iso,
+            require_usable=False,
+        )
+
     status_label = "changed" if changed_count > 0 else "unchanged"
     _record_verification_attempt(
         conn,
@@ -1160,28 +1417,40 @@ def process_verify_report(
     )
 
     discord_notified = False
+    revision_notify_suppressed = False
     if changed_count > 0:
-        try:
-            _send_discord_revision_alert(
+        if _revision_notify_suppressed(
+            conn,
+            prefecture=req.prefecture,
+            target_iso=target_iso,
+            attempted_at_iso=attempted_at_iso,
+        ):
+            revision_notify_suppressed = True
+        else:
+            notified_channels = notify_channels.notify_revision(
                 prefecture=req.prefecture,
                 target_iso=target_iso,
                 changed_count=changed_count,
                 diffs=diffs,
+                applied_to_db=applied_rows > 0,
             )
-            discord_notified = True
-        except httpx.HTTPError as e:
-            logger.warning(
-                "failed to send discord revision alert: pref=%s target=%s err=%s",
-                req.prefecture,
-                target_iso,
-                e,
-            )
+            discord_notified = "discord" in notified_channels
+            if notified_channels:
+                _record_revision_alert_sent(
+                    conn,
+                    prefecture=req.prefecture,
+                    target_iso=target_iso,
+                    alerted_at_iso=attempted_at_iso,
+                )
 
-    return VerifyReportResponse(
+    return _verify_report_response(
+        req,
         changed_count=changed_count,
         diffs=diffs,
         discord_notified=discord_notified,
-        attempt_logged=True,
+        revision_notify_suppressed=revision_notify_suppressed,
+        applied_rows=applied_rows,
+        revisions_logged=revisions_logged,
     )
 
 
@@ -1294,7 +1563,7 @@ async def get_collect_plan(
 @router.get(
     "/verify-plan",
     response_model=VerifyPlanResponse,
-    summary="内部: crawler 向け検証計画（1県・幅優先）",
+    summary="内部: crawler 向け検証計画（全県・同一 layer）",
     include_in_schema=False,
 )
 async def get_verify_plan(
@@ -1318,7 +1587,7 @@ async def get_verify_plan(
         description="対象県 ID をカンマ区切りで指定（省略時は全収集対象県）",
     ),
 ):
-    """幅優先（全県を同じ層で巡ってから次の時間層へ）で、次に検証する1県を返す。"""
+    """全県を同一 layer で検証するジョブ一覧を返す。"""
     verify_ingest_token(authorization)
 
     base_dt = _parse_base_target_iso(base_target)
@@ -1352,7 +1621,7 @@ async def post_verify_report(
     req: VerifyReportRequest,
     authorization: str | None = Header(None),
 ):
-    """再取得した測定値を DB と比較し、差分があれば Discord に通知する。"""
+    """再取得した測定値を DB と比較し、差分があれば通知・任意で UPSERT する。"""
     verify_ingest_token(authorization)
 
     now_iso = datetime.datetime.now(JST).isoformat()
@@ -1360,8 +1629,27 @@ async def post_verify_report(
 
     with connect_db(timeout=30.0) as conn:
         _ensure_tables(conn)
-        return process_verify_report(
+        result = process_verify_report(
             conn,
             req,
             attempted_at_iso=attempted_at_iso,
         )
+
+    evicted_grid = 0
+    evicted_response = 0
+    andersan_notified = False
+    if result.applied_rows > 0:
+        evicted_grid, evicted_response = _evict_caches(req.target_datetime)
+        andersan_notified = _notify_andersan_measurement_revision(
+            prefecture=req.prefecture,
+            target_datetime=req.target_datetime,
+            changed_count=result.changed_count,
+        )
+
+    return result.model_copy(
+        update={
+            "evicted_grid_cache": evicted_grid,
+            "evicted_response_cache": evicted_response,
+            "andersan_notified": andersan_notified,
+        }
+    )

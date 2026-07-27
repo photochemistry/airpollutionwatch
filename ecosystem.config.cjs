@@ -22,6 +22,9 @@ const apps = [
     ...baseApp,
     name: "airpollutionwatch-api",
     cwd: apiRoot,
+    env: {
+      VERIFY_APPLY_CHANGES: "true",
+    },
   },
 ];
 

@@ -18,6 +18,8 @@ pandas = "^2.2.3"
 numpy = "^2.2.0"
 airpollutionwatch = {path = "../airpollutionwatch"}
 httpx = "^0.28.1"
+nostr = "^0.0.2"
+websocket-client = "^1.9.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

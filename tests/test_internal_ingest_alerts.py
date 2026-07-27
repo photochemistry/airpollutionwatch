@@ -65,8 +65,89 @@ def test_empty_ok_records_warning_message(ingest_db):
             "SELECT error_message FROM ingest_attempts WHERE prefecture = 'nara'"
         )
         assert ing._EMPTY_DATA_ERROR in (cur.fetchone()[0] or "")
-        cur.execute("SELECT 1 FROM ingest_alert_sent WHERE prefecture = 'nara'")
+        cur.execute("SELECT 1 FROM ingest_alert_channel_sent WHERE prefecture = 'nara'")
         assert cur.fetchone() is None
+
+
+def test_notify_ingest_alert_skips_already_sent_channel(monkeypatch):
+    import notify as notify_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        notify_mod.discord,
+        "alert_webhook_url",
+        lambda: "https://example.com/discord",
+    )
+    monkeypatch.setattr(
+        notify_mod.discord,
+        "send_alert",
+        lambda **kwargs: calls.append("discord"),
+    )
+    monkeypatch.setattr(notify_mod.nostr, "alert_nsec", lambda: "nsec1test")
+    monkeypatch.setattr(notify_mod.nostr, "alert_relays", lambda: ["wss://nos.lol"])
+    monkeypatch.setattr(
+        notify_mod.nostr,
+        "send_alert",
+        lambda **kwargs: calls.append("nostr"),
+    )
+
+    channels = notify_mod.notify_ingest_alert(
+        prefecture="nara",
+        target_iso="2026-06-02T09:00:00+09:00",
+        since_iso="2026-06-02T06:00:00+09:00",
+        error="empty",
+        failure_hours=3,
+        alert_kind="no_data",
+        skip_channels=frozenset({"discord"}),
+    )
+
+    assert channels == ["nostr"]
+    assert calls == ["nostr"]
+
+
+def test_empty_ok_retries_nostr_after_discord_only(ingest_db, monkeypatch):
+    target = "2026-06-02T09:00:00+09:00"
+    req = ing.IngestRequest(
+        prefecture="nara",
+        target_datetime=target,
+        status="ok",
+        rows=[],
+    )
+    import config
+
+    monkeypatch.setattr(
+        ing,
+        "configured_alert_channels",
+        lambda: ["discord", "nostr"],
+    )
+
+    call_count = [0]
+
+    def fake_notify(**kwargs):
+        skip = kwargs.get("skip_channels") or frozenset()
+        call_count[0] += 1
+        if call_count[0] == 1:
+            assert skip == frozenset()
+            return ["discord"]
+        assert skip == frozenset({"discord"})
+        return ["nostr"]
+
+    monkeypatch.setattr(ing, "notify_ingest_alert", fake_notify)
+
+    with config.connect_db() as conn:
+        _post_ingest(conn, req, "2026-06-02T06:00:00+09:00")
+        _post_ingest(conn, req, "2026-06-02T10:00:00+09:00")
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT channel FROM ingest_alert_channel_sent WHERE prefecture = 'nara'"
+        )
+        assert {row[0] for row in cur.fetchall()} == {"discord"}
+
+        _post_ingest(conn, req, "2026-06-02T10:30:00+09:00")
+        cur.execute(
+            "SELECT channel FROM ingest_alert_channel_sent WHERE prefecture = 'nara'"
+        )
+        assert {row[0] for row in cur.fetchall()} == {"discord", "nostr"}
 
 
 def test_empty_ok_sends_discord_after_threshold(ingest_db):
@@ -79,13 +160,14 @@ def test_empty_ok_sends_discord_after_threshold(ingest_db):
     )
     import config
 
-    with patch.object(ing, "_send_discord_alert") as send_alert:
+    with patch.object(ing, "notify_ingest_alert") as send_alert:
         with config.connect_db() as conn:
             _post_ingest(conn, req, "2026-06-02T06:00:00+09:00")
             send_alert.assert_not_called()
             _post_ingest(conn, req, "2026-06-02T10:00:00+09:00")
             send_alert.assert_called_once()
             assert send_alert.call_args.kwargs["alert_kind"] == "no_data"
+            send_alert.return_value = ["discord"]
 
 
 def test_usable_data_clears_deficient_state(ingest_db):
@@ -114,6 +196,6 @@ def test_usable_data_clears_deficient_state(ingest_db):
         _post_ingest(conn, empty_req, "2026-06-02T10:00:00+09:00")
         _post_ingest(conn, ok_req, "2026-06-02T10:05:00+09:00")
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM ingest_alert_sent WHERE prefecture = 'nara'")
+        cur.execute("SELECT 1 FROM ingest_alert_channel_sent WHERE prefecture = 'nara'")
         assert cur.fetchone() is None
         assert ing._target_has_usable_measurements(conn, "nara", target)
